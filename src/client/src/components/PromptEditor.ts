@@ -130,10 +130,11 @@ export class PromptEditor extends LitElement {
   override render() {
     const shellInputMode = this.promptChips.length === 0 && this.currentInputMode.kind === "shell" ? this.currentInputMode : undefined;
     const shellMode = shellInputMode !== undefined;
-    const queuesInput = this.canSteer || this.isCompacting;
+    const canQueue = this.canSteer || this.isCompacting;
+    const canSteer = this.canSteer && !this.isCompacting;
     const sending = this.sending || this.chipSendingKey === this.composerKey();
     const busy = this.disabled || sending;
-    const hasWork = sending || queuesInput || this.canStop || isSessionActive(this.status, this.activity);
+    const hasWork = sending || canQueue || this.canStop || isSessionActive(this.status, this.activity);
     const activityText = composerActivityText(this.status, this.activity, sending);
     return html`
       <footer class=${shellMode ? "shell-mode" : ""} @paste=${(event: ClipboardEvent) => { void this.handlePaste(event); }} @dragover=${(event: DragEvent) => { this.handleDragOver(event); }} @drop=${(event: DragEvent) => { void this.handleDrop(event); }}>
@@ -155,8 +156,8 @@ export class PromptEditor extends LitElement {
         <div class="actions">
           ${this.renderCompactStatus()}
           <div class="message-actions">
-          ${queuesInput ? html`<button class="icon-button queue-button" ?disabled=${busy} title="Queue until the current activity finishes" aria-label="Queue message" @click=${() => { this.send("followUp"); }}>${renderQueueIcon()}</button>` : null}
-          ${this.canSteer && !this.isCompacting ? html`<button class="icon-button steer-button" ?disabled=${busy} title="Steer the current response before the next model call" aria-label="Steer current response" @click=${() => { this.send("steer"); }}>${renderSteerIcon()}</button>` : null}
+          <button class="icon-button queue-button" ?disabled=${busy || !canQueue} title="Queue until the current activity finishes" aria-label="Queue message" @click=${() => { this.send("followUp"); }}>${renderQueueIcon()}</button>
+          <button class="icon-button steer-button" ?disabled=${busy || !canSteer} title="Steer the current response before the next model call" aria-label="Steer current response" @click=${() => { this.send("steer"); }}>${renderSteerIcon()}</button>
           <button class="icon-button primary-button ${hasWork ? "stop-button" : "send-button"}" ?disabled=${hasWork ? this.disabled || !this.canStop : busy}
             title=${hasWork ? "Stop current work and clear queued messages" : "Send message"} aria-label=${hasWork ? "Stop current work" : "Send message"}
             @click=${() => { if (hasWork) this.onStop?.(); else this.send("followUp"); }}>${hasWork ? renderStopIcon() : renderSendIcon()}</button>

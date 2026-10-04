@@ -107,10 +107,14 @@ describe("production composer refresh", () => {
   it("reuses one focused Send/Stop button while preserving Queue, Steer and compaction permissions", async () => {
     const editor = await mount();
     const primary = control<HTMLButtonElement>(editor, ".primary-button");
+    const queue = control<HTMLButtonElement>(editor, ".queue-button");
+    const steer = control<HTMLButtonElement>(editor, ".steer-button");
     expect(primary.getAttribute("aria-label")).toBe("Send message");
     expect(editor.shadowRoot?.querySelector(".stop-button")).toBeNull();
-    expect(editor.shadowRoot?.querySelector(".queue-button")).toBeNull();
-    expect(editor.shadowRoot?.querySelector(".steer-button")).toBeNull();
+    expect(queue.disabled).toBe(true);
+    expect(steer.disabled).toBe(true);
+    expect(queue.getAttribute("aria-label")).toBe("Queue message");
+    expect(steer.getAttribute("aria-label")).toBe("Steer current response");
     editor.replaceText("idle send");
     primary.click();
     expect(editor.onSend).toHaveBeenLastCalledWith("idle send", undefined, undefined, undefined, undefined);
@@ -122,31 +126,37 @@ describe("production composer refresh", () => {
     expect(editor.shadowRoot?.activeElement).toBe(primary);
     expect(primary.getAttribute("aria-label")).toBe("Stop current work");
     expect(editor.shadowRoot?.querySelector(".send-button")).toBeNull();
+    expect(queue.disabled).toBe(false);
+    expect(steer.disabled).toBe(false);
     editor.replaceText("keep this draft");
     primary.click();
     expect(editor.onStop).toHaveBeenCalledOnce();
     expect(editor.onSend).toHaveBeenCalledOnce();
     expect(editor.view?.state.doc.toString()).toBe("keep this draft");
     editor.replaceText("follow up");
-    control<HTMLButtonElement>(editor, ".queue-button").click();
+    queue.click();
     expect(editor.onSend).toHaveBeenLastCalledWith("follow up", "followUp", undefined, undefined, undefined);
     editor.replaceText("steer");
-    control<HTMLButtonElement>(editor, ".steer-button").click();
+    steer.click();
     expect(editor.onSend).toHaveBeenLastCalledWith("steer", "steer", undefined, undefined, undefined);
     editor.isCompacting = true;
     await editor.updateComplete;
-    expect(control(editor, ".queue-button").getAttribute("aria-label")).toBe("Queue message");
-    expect(editor.shadowRoot?.querySelector(".steer-button")).toBeNull();
+    expect(queue.getAttribute("aria-label")).toBe("Queue message");
+    expect(queue.disabled).toBe(false);
+    expect(steer.disabled).toBe(true);
     editor.replaceText("after compaction");
-    control<HTMLButtonElement>(editor, ".queue-button").click();
+    queue.click();
     expect(editor.onSend).toHaveBeenLastCalledWith("after compaction", "followUp", undefined, undefined, undefined);
     editor.sending = true;
     await editor.updateComplete;
-    expect(control<HTMLButtonElement>(editor, ".queue-button").disabled).toBe(true);
+    expect(queue.disabled).toBe(true);
+    expect(steer.disabled).toBe(true);
     expect(primary.disabled).toBe(false);
     editor.disabled = true;
     await editor.updateComplete;
     expect(primary.disabled).toBe(true);
+    expect(queue.disabled).toBe(true);
+    expect(steer.disabled).toBe(true);
     expect(control<HTMLButtonElement>(editor, ".editor-attach").disabled).toBe(true);
     expect(editor.view?.contentDOM.contentEditable).toBe("false");
     editor.disabled = false;
@@ -157,7 +167,61 @@ describe("production composer refresh", () => {
     await editor.updateComplete;
     expect(control(editor, ".primary-button")).toBe(primary);
     expect(primary.getAttribute("aria-label")).toBe("Send message");
-    expect(editor.shadowRoot?.querySelector(".queue-button")).toBeNull();
+    expect(queue.disabled).toBe(true);
+    expect(steer.disabled).toBe(true);
+  });
+
+  it("keeps Queue and Steer permanently present in fixed positions and disables each exactly when unavailable", async () => {
+    const editor = await mount();
+    const actionButtons = Array.from(editor.shadowRoot?.querySelectorAll<HTMLButtonElement>(".message-actions button") ?? []);
+    const queue = control<HTMLButtonElement>(editor, ".queue-button");
+    const steer = control<HTMLButtonElement>(editor, ".steer-button");
+    const primary = control<HTMLButtonElement>(editor, ".primary-button");
+    expect(actionButtons).toEqual([queue, steer, primary]);
+
+    // 1. Idle state: both Queue and Steer are permanently rendered but disabled; primary is Send.
+    expect(editor.shadowRoot?.querySelector(".queue-button")).not.toBeNull();
+    expect(editor.shadowRoot?.querySelector(".steer-button")).not.toBeNull();
+    expect(queue.disabled).toBe(true);
+    expect(steer.disabled).toBe(true);
+    expect(primary.getAttribute("aria-label")).toBe("Send message");
+
+    // 2. Active streaming: both Queue and Steer are enabled; primary is Stop.
+    editor.canSteer = true;
+    editor.canStop = true;
+    await editor.updateComplete;
+    expect(queue.disabled).toBe(false);
+    expect(steer.disabled).toBe(false);
+    expect(primary.getAttribute("aria-label")).toBe("Stop current work");
+
+    // 3. Compacting only (canSteer = false): Queue is enabled, Steer is disabled.
+    editor.canSteer = false;
+    editor.isCompacting = true;
+    await editor.updateComplete;
+    expect(editor.shadowRoot?.querySelector(".steer-button")).not.toBeNull();
+    expect(queue.disabled).toBe(false);
+    expect(steer.disabled).toBe(true);
+
+    // 4. Compacting while canSteer = true: compaction takes precedence, Steer is disabled, Queue is enabled.
+    editor.canSteer = true;
+    editor.isCompacting = true;
+    await editor.updateComplete;
+    expect(queue.disabled).toBe(false);
+    expect(steer.disabled).toBe(true);
+
+    // 5. Active streaming but sending: both Queue and Steer are disabled.
+    editor.isCompacting = false;
+    editor.sending = true;
+    await editor.updateComplete;
+    expect(queue.disabled).toBe(true);
+    expect(steer.disabled).toBe(true);
+
+    // 6. Active streaming but composer disabled: both Queue and Steer are disabled.
+    editor.sending = false;
+    editor.disabled = true;
+    await editor.updateComplete;
+    expect(queue.disabled).toBe(true);
+    expect(steer.disabled).toBe(true);
   });
 
   it("renders upstream context chips once and preserves pending-send guards with the shared primary button", async () => {
