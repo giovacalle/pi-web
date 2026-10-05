@@ -106,6 +106,7 @@
             <a href="#chat-images">How do chat images load?</a>
             <a href="#sessions-stop">Sessions stop unexpectedly</a>
             <a href="#model-response-terminated">Model responses fail with 'terminated'</a>
+            <a href="#provider-extension-no-effect">My provider extension has no effect</a>
             <a href="#logs">Where are logs?</a>
           </aside>
 
@@ -397,6 +398,46 @@
                 </div>
                 <pre id="http-idle-timeout-restart"><code><span class="prompt">$</span> systemctl --user restart pi-web-sessiond</code></pre>
               </div>
+            </article>
+
+            <article id="provider-extension-no-effect" class="faq-item">
+              <h2>My provider extension loads but has no effect</h2>
+              <p>
+                PI WEB captures global extension provider registrations when the session daemon starts. An extension
+                can load successfully later while its provider change is ignored; any existing startup provider
+                remains in use. This avoids changing another session's endpoint, credentials, or streaming behavior.
+              </p>
+              <p>
+                On a native service install, run <code>pi-web logs</code> on the affected machine and look for
+                <code>PROVIDER_MUTATION_IGNORED</code>. Manual runs write these diagnostics to the daemon console.
+                Entries include the provider ID, operation, reason, and recovery guidance, without provider configuration
+                or credentials. Each operation/provider/reason is logged once per daemon lifetime, so check older
+                entries too. For Linux systemd, search the existing daemon log:
+              </p>
+              <div class="code-card">
+                <div class="copy-row">
+                  <strong>Find ignored provider changes (Linux systemd)</strong>
+                  <button class="copy-button" data-copy="#provider-mutation-logs">Copy</button>
+                </div>
+                <pre id="provider-mutation-logs"><code><span class="prompt">$</span> journalctl --user -u pi-web-sessiond --grep PROVIDER_MUTATION_IGNORED --no-pager</code></pre>
+              </div>
+              <ul>
+                <li><code>not-in-startup-baseline</code> is a warning: the extension registration was absent at startup, even if the provider's models already exist in <code>models.json</code>.</li>
+                <li><code>configuration-change</code> is a warning: the attempt would replace frozen settings or add a different provider implementation.</li>
+                <li><code>implementation-unverified</code> and <code>native-registration-frozen</code> are informational: a fresh callback or native provider object cannot prove that the code changed. These entries do not mean the startup provider is broken.</li>
+                <li><code>unregistration-frozen</code> is informational: the removal request was ignored. Unchanged config replays are silent.</li>
+              </ul>
+              <p>
+                For a global provider extension, install it in the daemon's active agent directory and register providers
+                in its factory before startup, then manually restart the session daemon when safe. Project-only or
+                <code>session_start</code>-only registrations are not enabled by restarting. A browser reload, web/API
+                restart, or <code>/reload</code> does not rebuild the baseline. Restarting interrupts active sessions
+                and terminals; wait for important work to finish and restart from outside the sessions it hosts.
+              </p>
+              <p>
+                These diagnostics stay in daemon logs; they do not create browser notifications or session warnings.
+                See the <a href="config#pi-extension-provider-baseline">provider baseline and model-list refresh rules</a>.
+              </p>
             </article>
 
             <article id="logs" class="faq-item">
