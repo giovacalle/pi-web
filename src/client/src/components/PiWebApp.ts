@@ -33,8 +33,8 @@ import { initialSessionWarningVisibilityState, reconcileSessionWarningVisibility
 import { RealtimeSocket, type BrowserRealtimeEvent } from "../sessionSocket";
 import { ServerNoticesController, visibleServerNotices } from "../serverNotices";
 import type { ServerNotice } from "../../../shared/apiTypes";
-import type { ApplicationPanelContext, PluginNavigationDestination, ContributionQueryValue, PiWebPluginRegistration, PluginMachine, PluginPromptEditor, QualifiedContributionId, QualifiedThemeContribution, QualifiedThemePairContribution, PluginRuntimeContext, WorkspaceFilesCapabilityV1, WorkspaceHost, WorkspaceInvalidation, WorkspaceLabelContext, WorkspaceLabelItem, WorkspacePanelContext, WorkspacePanelNavigationV1, WorkspacePanelTerminal, WorkspacePluginBinding, WorkspaceTerminalCommandInput } from "../plugins/types";
-import { CLASSIC_THEME_ID, DEFAULT_THEME_PREFERENCE, applyPiWebTheme, findThemePairForTheme, readStoredThemePreference, resolveThemePreference, writeStoredThemePreference, type ThemePreference, type ThemePreferenceResolution } from "../theme";
+import type { ApplicationPanelContext, PluginNavigationDestination, ContributionQueryValue, PiWebPluginRegistration, PluginMachine, PluginPromptEditor, QualifiedContributionId, PluginRuntimeContext, WorkspaceFilesCapabilityV1, WorkspaceHost, WorkspaceInvalidation, WorkspaceLabelContext, WorkspaceLabelItem, WorkspacePanelContext, WorkspacePanelNavigationV1, WorkspacePanelTerminal, WorkspacePluginBinding, WorkspaceTerminalCommandInput } from "../plugins/types";
+import { CLASSIC_THEME_ID, applyPiWebTheme, clearStoredThemePreference, effectiveThemePreference, readStoredThemePreference, resolveThemePreference, writeStoredThemePreference, type ThemePreference, type ThemePreferenceResolution } from "../theme";
 import { corePlugin } from "../plugins/core";
 import { themePackPlugin } from "../plugins/themes";
 import { loadExternalPlugins, type ExternalPluginLoadResult } from "../plugins/external";
@@ -96,9 +96,6 @@ const PI_WEB_STATUS_DEFER_MS = 750;
 const REMOTE_ROUTE_RESTORE_RETRY_DELAYS_MS = [1_000, 3_000, 8_000, 15_000, 30_000] as const;
 const WORKSPACE_DELETION_RECONCILE_RETRY_DELAYS_MS = [1_000, 2_000, 5_000, 10_000] as const;
 const GLOBAL_SHORTCUT_LISTENER_OPTIONS = { capture: true } as const;
-const THEME_AUTO_ON_VALUE = "auto:on";
-const THEME_AUTO_OFF_VALUE = "auto:off";
-const THEME_OPTION_PREFIX = "theme:";
 const TERMINAL_PANEL_LOCAL_ID = "workspace.terminal";
 const MIN_RESIZABLE_CHAT_WIDTH_PX = 320;
 const PANEL_EDGE_COLUMNS_WIDTH_PX = 2;
@@ -315,13 +312,18 @@ export class PiWebApp extends LitElement {
     { id: "themes", plugin: themePackPlugin },
   ]).then(({ failures }) => {
     if (failures.length > 0) throw failures[0]?.error;
+    if (this.isConnected) this.applyPreferredTheme(false);
     this.invalidateWorkspaceSurface();
   });
   private readonly loadedMachinePluginIds = new Set<string>();
   private readonly machinePluginLoadPromises = new Map<string, Promise<void>>();
   private gatewayPluginLoadPromise: Promise<void> | undefined;
   private gatewayPluginLoadAttemptComplete = false;
-  private themePreference: ThemePreference = readStoredThemePreference() ?? DEFAULT_THEME_PREFERENCE;
+  @state() private localThemePreference: ThemePreference | undefined = readStoredThemePreference();
+  @state() private configuredThemePreference: ThemePreference | undefined;
+  private get themePreference(): ThemePreference {
+    return effectiveThemePreference(this.localThemePreference, this.configuredThemePreference);
+  }
   @state() private activeThemeId: QualifiedContributionId = CLASSIC_THEME_ID;
   @state() private isRefreshingApp = false;
   @state() private sessionCleanupDialog: SessionCleanupDialogState | undefined;
@@ -330,6 +332,8 @@ export class PiWebApp extends LitElement {
   @state() private workspaceUploadDefaultFolder = effectiveWorkspaceUploadFolder(undefined);
   @state() private workspaceAttachmentsDefaultFolder = effectiveWorkspaceAttachmentsFolder(undefined);
   private sessionWarningVisibility = initialSessionWarningVisibilityState();
+  /** Browser-local acknowledgement, retained per machine/session until activity elsewhere clears. */
+  private readonly dismissedActivityNotices = new Set<string>();
   private readonly onPopState = () => {
     this.invalidateNavigationSelection();
     this.syncNavigationFreshness();
@@ -378,6 +382,7 @@ export class PiWebApp extends LitElement {
   protected override willUpdate(): void {
     this.toggleAttribute("pwa-display-mode", this.appShell.isPwaDisplayMode);
     this.syncSessionWarningVisibility();
+    this.syncSessionActivityAcknowledgement();
   }
 
   protected override updated(): void {
@@ -394,8 +399,60 @@ export class PiWebApp extends LitElement {
     this.sessionWarningVisibility = reconcileSessionWarningVisibility(
       this.sessionWarningVisibility,
       session === undefined ? undefined : machineSessionKey(selectedMachineId(this.state), session.id),
-      this.state.status === undefined ? undefined : this.state.status.warnings ?? [],
+      this.state.status?.sessionId === session?.id ? this.state.status?.warnings ?? [] : undefined,
     );
+  }
+
+  private syncSessionActivityAcknowledgement(): void {
+    if (this.dismissedActivityNotices.size === 0) return;
+    const session = this.state.selectedSession;
+    const status = this.state.status;
+    const machineId = selectedMachineId(this.state);
+    // The cache belongs to the selected machine and receives global updates for
+    // unselected sessions too. Their activity may clear while another chat is open.
+    for (const cachedStatus of Object.values(this.state.sessionStatuses)) {
+      if (cachedStatus.sessionId !== session?.id && cachedStatus.recentlyActiveElsewhere === false) {
+        this.dismissedActivityNotices.delete(machineSessionKey(machineId, cachedStatus.sessionId));
+      }
+    }
+    if (session !== undefined && status?.sessionId === session.id && status.recentlyActiveElsewhere === false) {
+      this.dismissedActivityNotices.delete(machineSessionKey(machineId, session.id));
+    }
+  }
+
+  private unacknowledgedActivitySessionKey(state = this.state): string | undefined {
+    const session = state.selectedSession;
+    if (session === undefined || state.status?.sessionId !== session.id || state.status.recentlyActiveElsewhere !== true) return undefined;
+    const sessionKey = machineSessionKey(selectedMachineId(state), session.id);
+    return this.dismissedActivityNotices.has(sessionKey) ? undefined : sessionKey;
+  }
+
+  private readonly handleDismissActivityNotice = async (): Promise<void> => {
+    const sessionKey = this.unacknowledgedActivitySessionKey();
+    if (sessionKey === undefined) return;
+    this.dismissedActivityNotices.add(sessionKey);
+    this.requestUpdate();
+    await this.updateComplete;
+    await this.promptEditor?.updateComplete;
+    const session = this.state.selectedSession;
+    if (session !== undefined
+      && machineSessionKey(selectedMachineId(this.state), session.id) === sessionKey
+      && this.unacknowledgedActivitySessionKey() === undefined
+      && this.effectiveMainView() === "chat"
+      && this.promptEditor?.disabled === false
+      && !this.isRenderedModalOpen()) this.promptEditor.focusInput();
+  };
+
+  private renderSessionActivityNotice(): TemplateResult | null {
+    if (this.unacknowledgedActivitySessionKey() === undefined) return null;
+    return html`
+      <section class="composer-activity-notice" role="alert" aria-label="Recent activity in another instance">
+        <div class="composer-activity-notice-text">
+          <p>Recently active in another PI-WEB instance. Avoid working on this session in both instances at once.</p>
+        </div>
+        <button type="button" @click=${this.handleDismissActivityNotice}>Dismiss and continue</button>
+      </section>
+    `;
   }
 
   private syncSelectedSessionReadState(): void {
@@ -636,6 +693,8 @@ export class PiWebApp extends LitElement {
   }
 
   private applyClientConfig(config: PiWebConfigValues): void {
+    this.configuredThemePreference = config.defaultTheme;
+    this.applyPreferredTheme(false);
     this.shortcutConfig = config.shortcuts ?? {};
     this.workspaceUploadDefaultFolder = effectiveWorkspaceUploadFolder(config);
     this.workspaceAttachmentsDefaultFolder = effectiveWorkspaceAttachmentsFolder(config);
@@ -1997,6 +2056,10 @@ export class PiWebApp extends LitElement {
     // Recheck the rendered boundary at the final side-effect point so a newer
     // or surviving modal keeps visual and keyboard focus ownership.
     if (!isCurrent() || this.isRenderedModalOpen()) return;
+    if (this.unacknowledgedActivitySessionKey() !== undefined) {
+      this.renderRoot.querySelector<HTMLButtonElement>(".composer-activity-notice button")?.focus();
+      return;
+    }
     this.promptEditor?.focusInput();
   }
 
@@ -3145,46 +3208,20 @@ export class PiWebApp extends LitElement {
     await this.sessions.setModel(value.slice(0, slash), value.slice(slash + 1));
   }
 
-  private openThemeDialog() {
-    const themes = this.plugins.getThemes();
-    const resolution = this.resolveCurrentThemePreference(themes);
-    const selectedThemeId = resolution.selectedTheme?.id;
-    const autoValue = this.themePreference.auto ? THEME_AUTO_OFF_VALUE : THEME_AUTO_ON_VALUE;
-    this.setState({
-      themeDialog: {
-        title: "Select Theme",
-        selectedValue: selectedThemeId === undefined ? autoValue : `${THEME_OPTION_PREFIX}${selectedThemeId}`,
-        options: [
-          {
-            value: autoValue,
-            label: `Auto ${this.themePreference.auto ? "✓ on" : "off"}`,
-            description: this.autoThemeDescription(resolution),
-          },
-          ...themes.map((theme) => ({
-            value: `${THEME_OPTION_PREFIX}${theme.id}`,
-            label: this.themeOptionLabel(theme, selectedThemeId),
-            description: this.themeOptionDescription(theme),
-          })),
-        ],
-      },
-    });
+  private openThemeDialog(): void {
+    this.navigateSettings("general");
   }
 
-  private pickTheme(value: string) {
-    this.setState({ themeDialog: undefined });
-    if (value === THEME_AUTO_ON_VALUE || value === THEME_AUTO_OFF_VALUE) {
-      const selectedThemeId = this.resolveCurrentThemePreference().selectedTheme?.id;
-      if (selectedThemeId === undefined) return;
-      this.themePreference = { themeId: selectedThemeId, auto: value === THEME_AUTO_ON_VALUE };
-      this.applyPreferredTheme(true);
-      return;
-    }
-    if (!value.startsWith(THEME_OPTION_PREFIX)) return;
-    const themeId = value.slice(THEME_OPTION_PREFIX.length);
-    const theme = this.plugins.getThemes().find((candidate) => candidate.id === themeId);
-    if (theme === undefined) return;
-    this.themePreference = { themeId: theme.id, auto: this.themePreference.auto };
+  private pickTheme(preference: ThemePreference): void {
+    if (!this.plugins.getThemes().some((theme) => theme.id === preference.themeId)) return;
+    this.localThemePreference = { ...preference };
     this.applyPreferredTheme(true);
+  }
+
+  private useDefaultTheme(): void {
+    this.localThemePreference = undefined;
+    clearStoredThemePreference();
+    this.applyPreferredTheme(false);
   }
 
   private applyPreferredTheme(persist: boolean): void {
@@ -3204,34 +3241,8 @@ export class PiWebApp extends LitElement {
     });
   }
 
-  private themePairForTheme(themeId: QualifiedContributionId): QualifiedThemePairContribution | undefined {
-    return findThemePairForTheme(this.plugins.getThemePairs(), themeId);
-  }
-
   private systemPrefersLight(): boolean {
     return this.systemLightThemeMedia?.matches ?? false;
-  }
-
-  private autoThemeDescription(resolution: ThemePreferenceResolution): string {
-    if (!this.themePreference.auto) return "Follow the system light/dark preference when the selected theme has a pair.";
-    if (resolution.selectedTheme === undefined) return "Follow the system light/dark preference when the selected theme has a pair.";
-    if (resolution.selectedThemePair === undefined) return "On, but the selected theme has no light/dark pair, so it will stay selected.";
-    return `On · ${resolution.selectedThemePair.name} follows the system ${this.systemPrefersLight() ? "light" : "dark"} preference.`;
-  }
-
-  private themeOptionLabel(theme: QualifiedThemeContribution, selectedThemeId: QualifiedContributionId | undefined): string {
-    const markers = [
-      ...(theme.id === selectedThemeId ? ["selected"] : []),
-      ...(theme.id === this.activeThemeId && theme.id !== selectedThemeId ? ["active"] : []),
-    ];
-    return markers.length === 0 ? theme.name : `${theme.name} ✓ ${markers.join(" · ")}`;
-  }
-
-  private themeOptionDescription(theme: QualifiedThemeContribution): string {
-    const parts: string[] = [theme.colorScheme];
-    if (this.themePairForTheme(theme.id) !== undefined) parts.push("auto pair");
-    if (theme.description !== undefined) parts.push(theme.description);
-    return parts.join(" · ");
   }
 
   private async openThinkingDialog() {
@@ -3281,6 +3292,7 @@ export class PiWebApp extends LitElement {
   }
 
   private async sendPrompt(text: string, streamingBehavior?: "steer" | "followUp", attachments?: import("../api").PromptAttachment[], delivery?: import("../../../shared/apiTypes").PromptAttachmentDelivery, folder?: string, chips: readonly StagedPromptChip[] = []): Promise<boolean> {
+    if (this.unacknowledgedActivitySessionKey() !== undefined) return false;
     const hasAttachments = attachments !== undefined && attachments.length > 0;
     if (chips.length === 0) {
       if (!hasAttachments && streamingBehavior === undefined && this.auth.handleSlashCommand(text)) return false;
@@ -3586,6 +3598,7 @@ export class PiWebApp extends LitElement {
   override render() {
     const state = this.state;
     const mainView = this.effectiveMainView();
+    const activityNoticeVisible = this.unacknowledgedActivitySessionKey(state) !== undefined;
     return html`
       <div class=${this.panelCollapse.shellClass(mainView)} style=${this.panelResize.shellStyle({ navigation: this.resizablePanelConstraints("navigation"), workspace: this.resizablePanelConstraints("workspace") })}>
         <aside id="navigation-panel">${this.appShell.isMobileNavigationLayout ? null : this.renderNavigationPanel()}</aside>
@@ -3601,7 +3614,10 @@ export class PiWebApp extends LitElement {
           <div class="mobile-navigation-panel">${this.appShell.isMobileNavigationLayout ? this.renderNavigationPanel() : null}</div>
           ${state.selectedSession ? html`
             ${this.renderChatView(state, state.selectedSession)}
-            <prompt-editor .promptChips=${this.selectedPromptChips()} .onRemoveChip=${this.handleRemovePromptChip} .shortcuts=${this.shortcutConfig} .sessionId=${state.selectedSession.id} .cwd=${state.selectedWorkspace?.path} .machineId=${selectedMachineId(state)} .projectId=${state.selectedWorkspace?.projectId} .workspaceId=${state.selectedWorkspace?.id} .attachmentsFolder=${workspaceEffectiveAttachmentsFolder(state.selectedWorkspace?.effectiveConfig, this.workspaceAttachmentsDefaultFolder)} .disabled=${state.selectedSession.archived === true} .canSteer=${state.status?.isStreaming === true} .isCompacting=${state.status?.isCompacting === true} .canStop=${state.status?.isStreaming === true || state.status?.isBashRunning === true || state.status?.isCompacting === true || (state.status?.pendingMessageCount ?? 0) > 0} .status=${state.status} .availableThinkingLevels=${state.availableThinkingLevels} .sending=${state.sendingPrompts[state.selectedSession.id] === true} .onSend=${this.handleSendPrompt} .onStop=${this.handleStopActiveWork} .onSelectModel=${this.handleSelectModel} .onSelectThinking=${this.handleSelectThinking}></prompt-editor>
+            <div class="composer-area">
+              <prompt-editor ?inert=${activityNoticeVisible} .promptChips=${this.selectedPromptChips()} .onRemoveChip=${this.handleRemovePromptChip} .shortcuts=${this.shortcutConfig} .sessionId=${state.selectedSession.id} .cwd=${state.selectedWorkspace?.path} .machineId=${selectedMachineId(state)} .projectId=${state.selectedWorkspace?.projectId} .workspaceId=${state.selectedWorkspace?.id} .attachmentsFolder=${workspaceEffectiveAttachmentsFolder(state.selectedWorkspace?.effectiveConfig, this.workspaceAttachmentsDefaultFolder)} .disabled=${state.selectedSession.archived === true || activityNoticeVisible} .canSteer=${state.status?.isStreaming === true} .isCompacting=${state.status?.isCompacting === true} .canStop=${state.status?.isStreaming === true || state.status?.isBashRunning === true || state.status?.isCompacting === true || (state.status?.pendingMessageCount ?? 0) > 0} .status=${state.status} .availableThinkingLevels=${state.availableThinkingLevels} .sending=${state.sendingPrompts[state.selectedSession.id] === true} .onSend=${this.handleSendPrompt} .onStop=${this.handleStopActiveWork} .onSelectModel=${this.handleSelectModel} .onSelectThinking=${this.handleSelectThinking}></prompt-editor>
+              ${this.renderSessionActivityNotice()}
+            </div>
             ${this.renderStatusBar(state)}
             ${state.commandDialog !== undefined ? html`<command-picker .title=${state.commandDialog.title} .options=${state.commandDialog.options} .onPick=${(value: string) => this.sessions.respondToCommand(state.commandDialog?.requestId ?? "", value)} .onCancel=${() => { this.sessions.cancelCommand(); }}></command-picker>` : null}
             ${state.modelDialog !== undefined ? html`<model-picker title=${state.modelDialog.title} .options=${state.modelDialog.options} .catalog=${state.modelDialog.catalog} .defaultValue=${state.modelDialog.defaultValue} .defaultsLoading=${state.modelDialog.defaultsLoading === true} .onSetDefault=${this.handleSetDefaultModel} .selectedValue=${state.modelDialog.selectedValue} .onPick=${(value: string) => { void this.pickModel(value); }} .onToggleEnabled=${this.handleToggleModelEnabled} .onSetScope=${this.handleSetModelScope} .onCancel=${() => { this.setState({ modelDialog: undefined }); }}></model-picker>` : null}
@@ -3625,8 +3641,7 @@ export class PiWebApp extends LitElement {
         ${state.projectDialogOpen ? html`<project-dialog .machineId=${selectedMachineId(state)} .onSubmit=${(path: string, create: boolean, trust: ProjectTrustChoice | undefined) => this.projects.addProject(path, create, trust)} .onCancel=${() => { this.setState({ projectDialogOpen: false }); }}></project-dialog>` : null}
         ${state.machineDialogOpen ? html`<machine-dialog .error=${state.error} .onSubmit=${(input: MachineDialogSubmit) => this.submitMachineDialog(input)} .onCancel=${() => { this.setState({ machineDialogOpen: false }); }}></machine-dialog>` : null}
         ${this.sessionCleanupDialog !== undefined ? html`<session-cleanup-dialog .preview=${this.sessionCleanupDialog.preview} .previewRequest=${this.sessionCleanupDialog.previewRequest} .result=${this.sessionCleanupDialog.result} .loading=${this.sessionCleanupDialog.loading === true} .running=${this.sessionCleanupDialog.running === true} .error=${this.sessionCleanupDialog.error ?? ""} .onPreview=${(request: SessionCleanupRequest) => { void this.previewSessionCleanup(request); }} .onRun=${(request: SessionCleanupRequest) => { void this.runSessionCleanup(request); }} .onClose=${() => { this.closeSessionCleanupDialog(); }}></session-cleanup-dialog>` : null}
-        ${state.themeDialog !== undefined ? html`<command-picker title=${state.themeDialog.title} .options=${state.themeDialog.options} .selectedValue=${state.themeDialog.selectedValue} .onPick=${(value: string) => { this.pickTheme(value); }} .onCancel=${() => { this.setState({ themeDialog: undefined }); }}></command-picker>` : null}
-        ${this.settingsSection !== undefined ? html`<settings-dialog .section=${this.settingsSection} .machine=${state.selectedMachine} .machineRuntime=${this.selectedMachineRuntime()} .actions=${this.getDefaultActions()} .onNavigate=${(section: SettingsSection) => { this.navigateSettings(section); }} .onClose=${() => { this.closeSettings(); }} .onConfigSaved=${(config: PiWebConfigValues) => { this.applyClientConfig(config); }} .onRefreshMachineRuntime=${async (machineId: string) => { await this.machines.refreshMachineRuntime(machineId); }}></settings-dialog>` : null}
+        ${this.settingsSection !== undefined ? html`<settings-dialog .section=${this.settingsSection} .machine=${state.selectedMachine} .machineRuntime=${this.selectedMachineRuntime()} .actions=${this.getDefaultActions()} .themes=${this.plugins.getThemes()} .themePreference=${this.themePreference} .activeThemeId=${this.activeThemeId} .hasLocalThemeOverride=${this.localThemePreference !== undefined} .onUseLocalTheme=${(preference: ThemePreference) => { this.pickTheme(preference); }} .onUseDefaultTheme=${() => { this.useDefaultTheme(); }} .onNavigate=${(section: SettingsSection) => { this.navigateSettings(section); }} .onClose=${() => { this.closeSettings(); }} .onConfigSaved=${(config: PiWebConfigValues) => { this.applyClientConfig(config); }} .onRefreshMachineRuntime=${async (machineId: string) => { await this.machines.refreshMachineRuntime(machineId); }}></settings-dialog>` : null}
       </div>
     `;
   }

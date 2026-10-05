@@ -2,6 +2,11 @@ import { describe, expect, it } from "vitest";
 import { ASK_USER_TEXT_MAX_LENGTH, EXTENSION_DIALOG_TEXT_MAX_LENGTH, SESSION_NOTIFICATION_LIMIT, SESSION_NOTIFICATION_MESSAGE_BYTES, SESSION_UNREAD_CATALOG_ID_MAX_LENGTH } from "../../../shared/apiTypes";
 import { parseAskUserCloseResponse, parseAuthProvidersResponse, parseCommandResult, parseExtensionDialogCloseResponse, parseFileContentResponse, parseFileSuggestion, parseMachineRuntime, parseMessagePage, parseOAuthFlowState, parsePiPackageMutationResponse, parsePiPackagesResponse, parsePiWebConfigResponse, parsePiWebPluginsResponse, parsePiWebRuntimeResponse, parsePiWebStatusResponse, parseRealtimeStreamEvent, parseSessionBulkArchiveResponse, parseSessionBulkDeleteArchivedResponse, parseSessionCleanupExecuteResponse, parseSessionCleanupPreviewResponse, parseSessionInfo, parseSessionModelCatalogResponse, parseSessionNotificationInboxEvent, parseSessionNotificationInboxSnapshot, parseSessionStartupProgressEvent, parseSessionStatus, parseSessionStreamEvent, parseSessionStreamSnapshot, parseSessionTreeForkResult, parseSessionTreeNavigateResult, parseSessionTreeSnapshot, parseSessionUnreadCatalogSnapshot, parseSessionUnreadEvent, parseSlashCommand, parseWorkspace, parseWorkspaceProviderResolution } from "./parsers";
 
+const legacyActivityWarning = {
+  severity: "info", source: "PI-WEB",
+  message: "Recently active in another PI-WEB instance. Avoid working on this session in both instances at once.",
+};
+
 describe("API parsers", () => {
   it("preserves interactive API-key flow hints and defaults providers without one", () => {
     const base = { id: "openai", name: "OpenAI", authType: "api_key", status: { configured: false } };
@@ -62,6 +67,17 @@ describe("API parsers", () => {
       effectiveConfig: { host: "127.0.0.1", port: 8504, allowedHosts: true, pathAccess: { allowedPaths: ["/tmp"] }, uploads: { defaultFolder: ".pi-web/uploads" }, attachments: { defaultFolder: ".pi-web/attachments" }, agent: { command: "agent-lab", dir: "/Users/dev/agent-profiles/lab" } },
       envOverrides: { host: true, port: false, allowedHosts: false, spawnSessions: false, subsessions: false, askUser: false },
     });
+  });
+
+  it("preserves theme defaults and rejects malformed theme data", () => {
+    const defaultTheme = { themeId: "themes:pi-web-light", auto: false };
+    const response = {
+      path: "/tmp/config.json", exists: true,
+      config: { defaultTheme }, effectiveConfig: { defaultTheme },
+      envOverrides: { host: false, port: false, allowedHosts: false, spawnSessions: false, subsessions: false, askUser: false },
+    };
+    expect(parsePiWebConfigResponse(response)).toMatchObject({ config: { defaultTheme }, effectiveConfig: { defaultTheme } });
+    expect(() => parsePiWebConfigResponse({ ...response, config: { defaultTheme: "dark" } })).toThrow("PI WEB config defaultTheme");
   });
 
   it("rejects malformed PI WEB attachments config fields", () => {
@@ -597,6 +613,7 @@ describe("API parsers", () => {
     })).toEqual({
       sessionId: "s1",
       persisted: true,
+      recentlyActiveElsewhere: false,
       isStreaming: false,
       isCompacting: true,
       isBashRunning: false,
@@ -624,6 +641,39 @@ describe("API parsers", () => {
     for (const type of ["session.tree.navigated", "session.tree.forked"]) {
       expect(() => parseSessionStreamEvent({ type, result: { cancelled: true } })).toThrow("Unsupported session stream event type");
     }
+  });
+
+  it.each([true, false])("preserves recentlyActiveElsewhere=%s independently of warnings", (recentlyActiveElsewhere) => {
+    const wire = { ...statusWire(), recentlyActiveElsewhere };
+    expect(parseSessionStatus(wire)).toMatchObject({ recentlyActiveElsewhere });
+    expect(parseRealtimeStreamEvent({ type: "status.update", status: wire })).toEqual({
+      type: "status.update", status: parseSessionStatus(wire),
+    });
+    expect(parseSessionStatus(wire).warnings).toBeUndefined();
+  });
+
+  it("normalizes older daemon activity warnings into status while retaining ordinary diagnostics", () => {
+    const skillWarning = { severity: "error", message: "bad skill", source: "skill" };
+    const extensionWarning = { ...legacyActivityWarning, source: "extension" };
+    const parsed = parseSessionStatus({ ...statusWire(), warnings: [legacyActivityWarning, skillWarning, extensionWarning] });
+
+    expect(parsed.recentlyActiveElsewhere).toBe(true);
+    expect(parsed.warnings).toEqual([skillWarning, extensionWarning]);
+  });
+
+  it.each([true, false])("prefers explicit activity status %s over a legacy warning", (recentlyActiveElsewhere) => {
+    const parsed = parseSessionStatus({ ...statusWire(), recentlyActiveElsewhere, warnings: [legacyActivityWarning] });
+    expect(parsed.recentlyActiveElsewhere).toBe(recentlyActiveElsewhere);
+    expect(parsed.warnings).toEqual([]);
+  });
+
+  it("normalizes older snapshots without an activity warning to false", () => {
+    expect(parseSessionStatus(statusWire()).recentlyActiveElsewhere).toBe(false);
+    expect(parseSessionStatus({ ...statusWire(), warnings: [{ ...legacyActivityWarning, source: "extension" }] }).recentlyActiveElsewhere).toBe(false);
+  });
+
+  it.each(["true", 1, null])("rejects malformed recentlyActiveElsewhere: %s", (value) => {
+    expect(() => parseSessionStatus({ ...statusWire(), recentlyActiveElsewhere: value })).toThrow("Expected optional boolean field: recentlyActiveElsewhere");
   });
 
   it("parses live session warnings including optional source and path", () => {
