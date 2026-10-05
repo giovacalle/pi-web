@@ -3089,9 +3089,15 @@ export class PiSessionService implements SessionRouteService {
         this.publishActivity(session, "reloading resources", "active");
         const priorGeneration = this.notificationGenerationBySession.get(session);
         let candidateGeneration: SessionNotificationGeneration | undefined;
+        const reloadBoundary = { beforeSessionStart: false };
         try {
-          await session.reload(priorGeneration === undefined ? undefined : {
+          await session.reload({
             beforeSessionStart: () => {
+              // The SDK invalidated the old runner. Settle its dialogs before
+              // replacement session_start handlers can open new ones.
+              this.endSessionExtensionDialogs(session.sessionId);
+              reloadBoundary.beforeSessionStart = true;
+              if (priorGeneration === undefined) return;
               candidateGeneration = this.notificationStore.beginReplacement(priorGeneration, notificationIdentityForSession(session));
               this.notificationGenerationBySession.set(session, candidateGeneration);
               this.replaceSessionNotificationContext(session, candidateGeneration);
@@ -3103,6 +3109,9 @@ export class PiSessionService implements SessionRouteService {
           this.publishActivity(session, "resources reloaded", "idle");
           this.publishStatus(session);
         } catch (error: unknown) {
+          // Settings/resource loading can fail after SDK invalidation but
+          // before the hook. Never sweep replacement session_start dialogs.
+          if (!reloadBoundary.beforeSessionStart) this.endSessionExtensionDialogs(session.sessionId);
           if (candidateGeneration !== undefined) {
             this.publishNotificationMutations(this.notificationStore.abortReplacement(candidateGeneration, "candidate"));
             this.notificationGenerationBySession.set(session, candidateGeneration);

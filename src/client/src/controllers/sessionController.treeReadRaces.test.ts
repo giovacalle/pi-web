@@ -13,9 +13,8 @@ const oldTail = page("old branch", 200, 300);
 const oldEarlier = page("old branch", 100, 300);
 const newTail = page("new branch", 150, 250);
 
-function fixture() {
+function fixture(cache = new Map<string, MessagePage>()) {
   let state: AppState = { ...initialAppState(), selectedWorkspace: workspace, sessions: [oldSession] };
-  const cache = new Map<string, MessagePage>();
   const transcripts = new ChatTranscriptStore({
     read: (id) => cache.get(id), write: (id, value) => { cache.set(id, value); }, remove: (id) => { cache.delete(id); },
   });
@@ -36,17 +35,97 @@ function fixture() {
     state = { ...state, treeDialog: { nodes: [{ id: "root", parentId: null, kind: "user", summary: "prompt" }], activeLeafId: "root", activePathIds: ["root"] } };
     return controller.navigateTree("root", { mode: "none" });
   }
-  function expectNewBranch() {
+  function expectNewBranch(current = newTail) {
     expect(state.selectedSession?.id).toBe(oldSession.id);
-    expect(state.messagePageStart).toBe(150);
-    expect(state.messagePageTotal).toBe(250);
-    expect(transcripts.rawHistoryPage(key)).toEqual(newTail);
+    expect(state.messagePageStart).toBe(current.start);
+    expect(state.messagePageTotal).toBe(current.total);
+    expect(transcripts.rawHistoryPage(key)).toEqual(current);
     expect(state.messages.every((message) => message.parts.some((part) => part.type === "text" && part.text.startsWith("new branch")))).toBe(true);
   }
-  return { controller, cache, transcriptSnapshot, messages, changeBranch, expectNewBranch, state: () => state };
+  return { controller, cache, socket, transcripts, transcriptSnapshot, messages, changeBranch, expectNewBranch, state: () => state };
 }
 
 describe("SessionController branch read ownership", () => {
+  it.each(["reconnect", "reselect", "reload"] as const)("recovers a changed branch by reads after %s without receiving its invalidation", async (trigger) => {
+    const f = fixture();
+    let restored: ReturnType<typeof fixture> | undefined;
+    try {
+      await f.controller.selectSession(oldSession, { updateUrl: false });
+      await f.controller.loadEarlierMessages();
+      expect(f.state().messagePageStart).toBe(100);
+      // No session.tree.changed frame: the mutation happened while offline or
+      // while another conversation was selected. Cached history is not truth.
+      if (trigger === "reload") {
+        f.controller.dispose();
+        restored = fixture(f.cache);
+        restored.transcriptSnapshot.mockReset().mockImplementation(() => transcriptSnapshotFixture(newTail, status(oldSession.id), { seq: 2, partial: null }));
+        await restored.controller.selectSession(oldSession, { updateUrl: false });
+        restored.expectNewBranch();
+      } else {
+        if (trigger === "reconnect") {
+          f.socket.reconnect();
+          await f.controller.refreshSelectedSession();
+        } else {
+          await f.controller.selectSession(oldSession, { updateUrl: false });
+        }
+        f.expectNewBranch();
+      }
+    } finally {
+      restored?.controller.dispose();
+      f.controller.dispose();
+    }
+  });
+
+  it.each([250, 300])("retires an earlier-page response when a snapshot discovers a missed tree change (total=%s)", async (total) => {
+    const f = fixture();
+    const current = page("new branch", total - 100, total);
+    const earlier = deferred<MessagePage>();
+    f.messages.mockReturnValueOnce(earlier.promise);
+    try {
+      await f.controller.selectSession(oldSession, { updateUrl: false });
+      f.transcriptSnapshot.mockImplementation(() => transcriptSnapshotFixture(current, status(oldSession.id), { seq: 2, partial: null }));
+      const loading = f.controller.loadEarlierMessages();
+      await vi.waitFor(() => { expect(f.messages).toHaveBeenCalledOnce(); });
+      const revision = f.transcripts.historyRevision(key);
+      f.socket.reconnect();
+      await f.controller.refreshSelectedSession();
+      f.expectNewBranch(current);
+      expect(f.transcripts.historyRevision(key)).toBeGreaterThan(revision);
+      earlier.resolve(oldEarlier);
+      await loading;
+      f.expectNewBranch(current);
+      expect(f.state().isLoadingEarlierMessages).toBe(false);
+    } finally {
+      earlier.resolve(oldEarlier);
+      f.controller.dispose();
+    }
+  });
+
+  it("keeps earlier pages when same-branch pagination observes an append after a delayed snapshot's capture", async () => {
+    const f = fixture();
+    const snapshot = deferred<SessionTranscriptSnapshot>();
+    try {
+      await f.controller.selectSession(oldSession, { updateUrl: false });
+      f.transcriptSnapshot.mockReturnValueOnce(snapshot.promise);
+      const polling = f.controller.refreshSelectedSession();
+      await vi.waitFor(() => { expect(f.transcriptSnapshot).toHaveBeenCalledTimes(2); });
+      f.messages.mockResolvedValueOnce({ ...oldEarlier, total: 301 });
+      await f.controller.loadEarlierMessages();
+      expect(f.state().messagePageStart).toBe(100);
+      expect(f.state().messagePageTotal).toBe(301);
+      const revision = f.transcripts.historyRevision(key);
+      snapshot.resolve({ page: oldTail, status: status(oldSession.id), seq: 0, partial: null });
+      await polling;
+      expect(f.state().messagePageStart).toBe(100);
+      expect(f.state().messagePageTotal).toBe(300);
+      expect(f.transcripts.rawHistoryPage(key)).toEqual({ start: 100, total: 300, messages: [...oldEarlier.messages, ...oldTail.messages] });
+      expect(f.transcripts.historyRevision(key)).toBe(revision);
+    } finally {
+      snapshot.resolve({ page: oldTail, status: status(oldSession.id), seq: 0, partial: null });
+      f.controller.dispose();
+    }
+  });
+
   it.each(["observer", "explicit"] as const)("retires an earlier-page response across %s tree changes without changing selection", async (trigger) => {
     const f = fixture();
     const earlier = deferred<MessagePage>();

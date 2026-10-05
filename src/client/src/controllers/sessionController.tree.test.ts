@@ -496,6 +496,9 @@ describe("SessionController session tree navigation", () => {
 
     const navigation = controller.navigateTree("root", { mode: "none" });
     await controller.selectSession(replacementSession, { updateUrl: false });
+    // The destination's own join refreshes its cache independently. Inspect
+    // only the delayed source mutation's effects from here.
+    removedKeys.length = 0;
     navigationResult.resolve({ cancelled: false, editorText: "originating draft" });
     await navigation;
 

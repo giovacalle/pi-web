@@ -1413,7 +1413,7 @@ export class SessionController {
           // History, partial, and watermark describe the same daemon boundary.
           // Replay only events newer than it; never overwrite an already-applied
           // live event with a response that was captured before that event.
-          const history = this.transcripts.mergeHistory(key, page);
+          const history = this.transcripts.mergeSnapshot(key, page);
           const messages = this.transcripts.seedStreamingPartial(history.messages, snapshot.partial);
           this.streamWatermark = { sessionId: target.session.id, seq: snapshot.seq };
           this.setState({

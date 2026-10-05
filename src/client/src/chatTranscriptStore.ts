@@ -1,6 +1,6 @@
 import { normalizeMessages } from "./chatMessages";
 import { applyTranscriptEvent, seedStreamingPartial } from "./chatTranscript";
-import { mergeChatHistory, readChatHistoryCache, removeChatHistoryCache, writeChatHistoryCache, type RawMessagePage } from "./chatHistoryCache";
+import { canMergeHistorySnapshot, mergeChatHistory, readChatHistoryCache, removeChatHistoryCache, writeChatHistoryCache, type RawMessagePage } from "./chatHistoryCache";
 import type { ChatLine } from "./components/shared";
 import type { SessionUiEvent } from "./sessionSocket";
 
@@ -36,7 +36,23 @@ export class ChatTranscriptStore {
   }
 
   mergeHistory(sessionId: string, page: RawMessagePage): ChatTranscriptView {
-    const history = mergeChatHistory(this.rawHistoryPage(sessionId), page);
+    return this.storeHistory(sessionId, mergeChatHistory(this.rawHistoryPage(sessionId), page));
+  }
+
+  /** Recover current history by reads even when the branch-change event was missed. */
+  mergeSnapshot(sessionId: string, page: RawMessagePage): ChatTranscriptView {
+    const history = this.rawHistoryPage(sessionId);
+    if (history !== undefined && !canMergeHistorySnapshot(history, page)) {
+      // Also retire outstanding pagination reads from the abandoned projection.
+      this.discard(sessionId);
+      return this.storeHistory(sessionId, page);
+    }
+    const merged = mergeChatHistory(history, page);
+    // Unlike pagination's hints, the snapshot owns this projection's count.
+    return this.storeHistory(sessionId, { ...merged, total: page.total });
+  }
+
+  private storeHistory(sessionId: string, history: RawMessagePage): ChatTranscriptView {
     this.rawHistoryPages.set(sessionId, history);
     this.cache.write(sessionId, history);
     return transcriptViewFromHistory(history);

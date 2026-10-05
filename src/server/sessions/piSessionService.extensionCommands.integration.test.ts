@@ -39,12 +39,12 @@ type CommandAction = (ctx: ExtensionCommandContext) => Promise<unknown>;
 
 // Real resource loader, ExtensionRunner, persistent tree and AgentSessionRuntime.
 // Only configuration/model access and extension-owned workflow controls are isolated.
-async function fixture(options: { rootUser?: boolean } = {}) {
+async function fixture(options: { rootUser?: boolean; notificationsDisabled?: boolean } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "pi-web-extension-commands-"));
   const agentDir = join(directory, "agent");
   const sessionDir = join(directory, "sessions");
-  const controls: { input?: ReturnType<typeof gate>; tree?: ReturnType<typeof gate>; fork?: ReturnType<typeof gate>; cancelTree: boolean; cancelFork: boolean; forkStartupDialog: boolean } = {
-    cancelTree: false, cancelFork: false, forkStartupDialog: false,
+  const controls: { input?: ReturnType<typeof gate>; tree?: ReturnType<typeof gate>; fork?: ReturnType<typeof gate>; cancelTree: boolean; cancelFork: boolean; forkStartupDialog: boolean; reloadStartupDialog: boolean } = {
+    cancelTree: false, cancelFork: false, forkStartupDialog: false, reloadStartupDialog: false,
   };
   const cleanup: { service?: PiSessionService } = {};
   onTestFinished(async () => {
@@ -82,12 +82,18 @@ async function fixture(options: { rootUser?: boolean } = {}) {
   });
   const starts: { id: string; generation: number; reason: string }[] = [];
   const startupDialogs: { id: string; announcedBeforeStart: boolean; accepted?: boolean }[] = [];
+  const reloadDialogs: Promise<boolean>[] = [];
+  let archived = options.notificationsDisabled === true;
   let generation = 0;
   let current: AgentSession | undefined;
   let pending: { action: CommandAction; complete: (outcome: CommandOutcome) => void } | undefined;
   const list = () => SessionManager.list(directory, sessionDir);
   const hosted = new PiSessionService(hub, {
-    agentDir, modelRuntime, sessionEvents, archiveStore: emptyArchiveStore(), heartbeatIntervalMs: 60_000,
+    agentDir, modelRuntime, sessionEvents, heartbeatIntervalMs: 60_000,
+    archiveStore: {
+      ...emptyArchiveStore(),
+      get: () => Promise.resolve(archived ? { sessionId: manager.getSessionId(), cwd: directory, archivedAt: "2026-02-01T10:00:00.000Z", archivePath: originalFile } : undefined),
+    },
     sessionManager: {
       ...sessionGateway([]), create: () => manager, open: (path) => SessionManager.open(path, sessionDir),
       list, listAll: list, resolveSessionFile: resolveSessionFileFromList(list),
@@ -109,6 +115,9 @@ async function fixture(options: { rootUser?: boolean } = {}) {
                 const dialog: (typeof startupDialogs)[number] = { id, announcedBeforeStart: hub.globalEvents.some((item) => item.type === "session.created" && item.session.id === id) };
                 startupDialogs.push(dialog);
                 dialog.accepted = await ctx.ui.confirm("Start this fork?", "Answer when a client joins later");
+              }
+              if (event.reason === "reload" && controls.reloadStartupDialog) {
+                reloadDialogs.push(ctx.ui.confirm("Start after reload?", "Keep this replacement dialog answerable"));
               }
             });
             pi.on("session_before_tree", async () => {
@@ -158,7 +167,13 @@ async function fixture(options: { rootUser?: boolean } = {}) {
     },
   });
   cleanup.service = hosted;
-  await hosted.start(directory);
+  if (archived) {
+    // Exercise the notification-disabled archive read path, then an external restore.
+    await hosted.status({ id: manager.getSessionId(), cwd: directory });
+    archived = false;
+  } else {
+    await hosted.start(directory);
+  }
   function session(): AgentSession {
     if (current === undefined) throw new Error("Fixture session has not started");
     return current;
@@ -177,7 +192,7 @@ async function fixture(options: { rootUser?: boolean } = {}) {
       return await completion.promise;
     } finally { connection.close(); }
   }
-  return { service: hosted, hub, manager, controls, session, ref, run, starts, startupDialogs, diskList: list, earlier: earlier ?? draft, draft, latest, draftText, originalFile };
+  return { service: hosted, hub, manager, controls, session, ref, run, starts, startupDialogs, reloadDialogs, diskList: list, earlier: earlier ?? draft, draft, latest, draftText, originalFile };
 }
 
 describe("hosted ExtensionCommandContext actions with native Pi", () => {
@@ -475,6 +490,81 @@ describe("hosted ExtensionCommandContext actions with native Pi", () => {
     f.controls.cancelTree = false;
     await expect(f.run((ctx) => ctx.navigateTree(f.earlier))).resolves.toEqual({ result: { cancelled: false } });
     expect(f.manager.getLeafId()).toBe(f.earlier);
+  });
+
+  it.each([false, true])("settles obsolete reload dialogs but retains replacement session_start dialogs (notificationsDisabled=%s)", async (notificationsDisabled) => {
+    const f = await fixture({ notificationsDisabled });
+    const ctx = f.session().extensionRunner.createContext();
+    const confirm = ctx.ui.confirm("Old confirm?", "From the obsolete runner");
+    const input = ctx.ui.input("Old input?");
+    const oldDialogs = (await f.service.status(f.ref())).pendingDialogs ?? [];
+    expect(oldDialogs).toHaveLength(2);
+    expect(oldDialogs.every((dialog) => !dialog.runScoped)).toBe(true);
+    f.controls.reloadStartupDialog = true;
+
+    await expect(f.run((command) => command.reload())).resolves.toEqual({ result: undefined });
+
+    expect(() => ctx.sessionManager.getSessionId()).toThrow("stale");
+    const replacement = (await f.service.status(f.ref())).pendingDialogs ?? [];
+    expect(replacement).toEqual([expect.objectContaining({ title: "Start after reload?" })]);
+    await expect(confirm).resolves.toBe(false);
+    await expect(input).resolves.toBeUndefined();
+    expect(f.hub.sessionEvents.flatMap(({ event }) => event.type === "dialog.closed" ? [event] : [])).toEqual(
+      oldDialogs.map(({ dialogId }) => ({ type: "dialog.closed", dialogId, reason: "session-ended" })),
+    );
+    for (const old of oldDialogs) {
+      await expect(f.service.answerDialog(f.ref(), old.dialogId, true)).resolves.toHaveProperty("result", "stale");
+    }
+    if (notificationsDisabled) expect(f.service.notificationCatalog().sessions).toEqual([]);
+    const dialog = replacement[0];
+    if (dialog === undefined) throw new Error("Missing replacement dialog");
+    await f.service.answerDialog(f.ref(), dialog.dialogId, true);
+    await expect(f.reloadDialogs[0]).resolves.toBe(true);
+    expect((await f.service.status(f.ref())).pendingDialogs ?? []).toEqual([]);
+  });
+
+  it.each([false, true])("settles obsolete dialogs when SDK reload fails before session_start (notificationsDisabled=%s)", async (notificationsDisabled) => {
+    const f = await fixture({ notificationsDisabled });
+    const ctx = f.session().extensionRunner.createContext();
+    const confirm = ctx.ui.confirm("Old confirm?", "From the obsolete runner");
+    const old = (await f.service.status(f.ref())).pendingDialogs?.[0];
+    if (old === undefined) throw new Error("Missing old dialog");
+    const failedSettings = vi.spyOn(f.session().settingsManager, "reload").mockRejectedValueOnce(new Error("settings reload failed"));
+    onTestFinished(() => { failedSettings.mockRestore(); });
+
+    await expect(f.run((command) => command.reload())).resolves.toEqual({ error: "settings reload failed" });
+
+    expect(() => ctx.sessionManager.getSessionId()).toThrow("stale");
+    expect((await f.service.status(f.ref())).pendingDialogs ?? []).toEqual([]);
+    await expect(confirm).resolves.toBe(false);
+    expect(f.starts).toHaveLength(1);
+    expect(f.hub.sessionEvents.flatMap(({ event }) => event.type === "dialog.closed" ? [event] : [])).toEqual([
+      { type: "dialog.closed", dialogId: old.dialogId, reason: "session-ended" },
+    ]);
+    expect(f.hub.sessionEvents).toContainEqual({ sessionId: f.ref().id, event: { type: "session.error", message: "settings reload failed" } });
+  });
+
+  it("does not sweep replacement session_start dialogs when reload fails after the hook", async () => {
+    const f = await fixture();
+    const confirm = f.session().extensionRunner.createContext().ui.confirm("Old confirm?", "From the obsolete runner");
+    f.controls.reloadStartupDialog = true;
+    const nativeReload = f.session().reload.bind(f.session());
+    const failedReload = vi.spyOn(f.session(), "reload").mockImplementation(async (options) => {
+      await nativeReload(options);
+      throw new Error("reload failed after startup");
+    });
+    onTestFinished(() => { failedReload.mockRestore(); });
+
+    await expect(f.run((command) => command.reload())).resolves.toEqual({ error: "reload failed after startup" });
+
+    const replacement = (await f.service.status(f.ref())).pendingDialogs ?? [];
+    expect(replacement).toEqual([expect.objectContaining({ title: "Start after reload?" })]);
+    await expect(confirm).resolves.toBe(false);
+    expect(f.hub.sessionEvents.filter(({ event }) => event.type === "dialog.closed")).toHaveLength(1);
+    const dialog = replacement[0];
+    if (dialog === undefined) throw new Error("Missing replacement dialog");
+    await f.service.answerDialog(f.ref(), dialog.dialogId, true);
+    await expect(f.reloadDialogs[0]).resolves.toBe(true);
   });
 
   it("waits for native tree work, reloads actual extensions, and explicitly rejects unsupported identity changes", async () => {
