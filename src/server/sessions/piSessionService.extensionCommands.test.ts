@@ -57,9 +57,10 @@ describe("PiSessionService extension command-context actions", () => {
     const options = { summarize: true, customInstructions: "focus", replaceInstructions: true, label: "checkpoint" };
     expect(await h.run((actions) => actions.navigateTree("target", options))).toEqual({ value: { cancelled: false } });
     expect(h.navigateTree).toHaveBeenCalledWith("target", options);
-    expect(h.hub.sessionEvents).toContainEqual({ sessionId: SESSION_ID,
-      event: { type: "session.tree.navigated", result: { cancelled: false, editorText: "edit this prompt" } },
-    });
+    expect(h.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.changed")).toEqual([
+      { sessionId: SESSION_ID, event: { type: "session.tree.changed" } },
+    ]);
+    expect(await h.service.status(ref)).toHaveProperty("suggestedInput", "edit this prompt");
   });
 
   it.each([undefined, "before", "at"] as const)("preserves extension fork position %s", async (position) => {
@@ -67,17 +68,75 @@ describe("PiSessionService extension command-context actions", () => {
     expect(await h.run((actions) => actions.fork("entry", position === undefined ? undefined : { position })))
       .toEqual({ value: { cancelled: false } });
     expect(h.fork).toHaveBeenCalledWith("entry", { position: position ?? "before" });
-    expect(h.hub.sessionEvents.find(({ event }) => event.type === "session.tree.forked")).toMatchObject({
-      sessionId: SESSION_ID, event: { type: "session.tree.forked", result: { cancelled: false, promptDraft: "fork draft" } },
-    });
+    expect(h.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.changed")).toEqual([
+      { sessionId: SESSION_ID, event: { type: "session.tree.changed" } },
+    ]);
+    expect(await h.service.status(ref)).toHaveProperty("suggestedInput", "fork draft");
   });
 
   it.each(["navigateTree", "fork"] as const)("does not announce changes when %s is cancelled", async (action) => {
     const h = await harness();
+    await h.actions.navigateTree("draft");
+    h.hub.sessionEvents.length = 0;
     h.navigateTree.mockResolvedValue({ cancelled: true });
     h.fork.mockResolvedValue({ cancelled: true });
     expect(await h.actions[action]("target")).toEqual({ cancelled: true });
-    expect(h.hub.sessionEvents.some(({ event }) => event.type === "session.tree.navigated" || event.type === "session.tree.forked")).toBe(false);
+    expect(h.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.changed")).toEqual([]);
+    expect(await h.service.status(ref)).toHaveProperty("suggestedInput", "edit this prompt");
+  });
+
+  it("shares factual change and suggested-input behavior with HTTP tree operations", async () => {
+    const h = await harness();
+    expect(await h.service.navigateTree(ref, { targetId: "target", expectedLeafId: "leaf-1", summary: { mode: "none" } }))
+      .toEqual({ cancelled: false, editorText: "edit this prompt" });
+    expect(await h.service.status(ref)).toHaveProperty("suggestedInput", "edit this prompt");
+    expect(await h.service.forkFromTree(ref, { entryId: "entry", expectedLeafId: "leaf-1" }))
+      .toMatchObject({ cancelled: false, session: { id: SESSION_ID }, promptDraft: "fork draft" });
+    expect(await h.service.status(ref)).toHaveProperty("suggestedInput", "fork draft");
+    expect(h.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.changed")).toEqual([
+      { sessionId: SESSION_ID, event: { type: "session.tree.changed" } },
+      { sessionId: SESSION_ID, event: { type: "session.tree.changed" } },
+    ]);
+  });
+
+  it("keeps the latest generated input and clears it on successful navigation without text", async () => {
+    const h = await harness();
+    await h.actions.navigateTree("draft");
+    h.navigateTree.mockResolvedValue({ cancelled: false, editorText: "newer draft" });
+    await h.actions.navigateTree("newer");
+    expect(await h.service.status(ref)).toHaveProperty("suggestedInput", "newer draft");
+    h.navigateTree.mockResolvedValue({ cancelled: false });
+    await h.actions.navigateTree("assistant");
+    expect(await h.service.status(ref)).not.toHaveProperty("suggestedInput");
+  });
+
+  it("clears generated input only when a user message starts, not on command or assistant activity", async () => {
+    const h = await harness();
+    await h.actions.navigateTree("draft");
+    expect(await h.run(() => Promise.resolve())).toEqual({ value: undefined });
+    h.fake.emit({ type: "message_start", message: { role: "assistant", content: [] } });
+    expect(await h.service.status(ref)).toHaveProperty("suggestedInput", "edit this prompt");
+    h.fake.emit({ type: "message_start", message: { role: "user", content: "submitted draft" } });
+    expect(await h.service.status(ref)).not.toHaveProperty("suggestedInput");
+  });
+
+  it("does not retain generated input after closing and reopening the runtime", async () => {
+    const h = await harness();
+    await h.actions.navigateTree("draft");
+    expect(await h.service.status(ref)).toHaveProperty("suggestedInput", "edit this prompt");
+    await h.service.stop(ref);
+    expect(await h.service.status(ref)).not.toHaveProperty("suggestedInput");
+  });
+
+  it("lists an already hosted runtime absent disk without opening it again or duplicating disk records", async () => {
+    const h = await harness();
+    const bindings = h.fake.calls.bindExtensions.length;
+    h.gateway.list = () => Promise.resolve([]);
+    expect(await h.service.list(ref.cwd)).toEqual([expect.objectContaining({ id: SESSION_ID, cwd: ref.cwd })]);
+    expect(await h.service.list("/other-workspace")).toEqual([]);
+    h.gateway.list = () => Promise.resolve([sessionRecord(SESSION_ID)]);
+    expect(await h.service.list(ref.cwd)).toHaveLength(1);
+    expect(h.fake.calls.bindExtensions).toHaveLength(bindings);
   });
 
   it.each(["isStreaming", "isCompacting", "isBashRunning", "pendingMessageCount"] as const)("preserves %s protection during an extension command", async (flag) => {

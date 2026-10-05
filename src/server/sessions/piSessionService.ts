@@ -228,17 +228,9 @@ interface ExtensionCommandSubmission {
   active: boolean;
 }
 
-interface ExtensionSessionReplacement {
-  active: boolean;
-  channelId: string;
-  result?: Extract<ClientSessionTreeForkResult, { cancelled: false }>;
-  announcedResult?: Extract<ClientSessionTreeForkResult, { cancelled: false }>;
-}
-
 interface ExtensionCommandExecution {
   submission?: ExtensionCommandSubmission;
   sessionControl?: boolean;
-  replacement?: ExtensionSessionReplacement;
 }
 
 function sessionTreeNavigationOptions(request: ClientSessionTreeNavigateRequest): PiTreeNavigationOptions {
@@ -409,7 +401,7 @@ export interface PiSessionManager {
   getLeafId(): string | null;
   branch(branchFromId: string): void;
   resetLeaf(): void;
-  getHeader?(): { parentSession?: string } | null | undefined;
+  getHeader?(): { parentSession?: string; timestamp?: string } | null | undefined;
   appendCustomEntry?(customType: string, data?: unknown): string;
 }
 
@@ -1189,6 +1181,8 @@ export class PiSessionService implements SessionRouteService {
    * can anchor the selected branch on disk.
    */
   private readonly unpersistedTreeBranchLeaves = new WeakMap<PiAgentSession, string | null>();
+  /** Latest prepared text belongs to the session, never to a browser's unsent draft. */
+  private readonly suggestedInputs = new Map<string, string>();
   /** Counts async operations that may append an entry before they settle. */
   private readonly sessionEntryMutationCounts = new WeakMap<PiAgentSession, number>();
   /** Exempt only a command's own prompt receipt while it invokes guarded session control. */
@@ -1463,6 +1457,7 @@ export class PiSessionService implements SessionRouteService {
     this.active.clear();
     this.pendingSessionOpens.clear();
     this.startupSessions.clear();
+    this.suggestedInputs.clear();
     this.activities.clear();
     this.compactionPromptQueues.clear();
     this.authLossWarnings.clear();
@@ -1497,7 +1492,16 @@ export class PiSessionService implements SessionRouteService {
     for (const record of archivedForCwd) {
       this.publishNotificationMutations(this.notificationStore.clearSession(record.sessionId, "archive-reconcile"));
     }
-    const unarchivedSessions = sessions.filter((session) => !archivedById.has(session.id)).map(clientSessionFromListEntry);
+    const unarchivedById = new Map(sessions.filter((session) => !archivedById.has(session.id))
+      .map((session) => [session.id, clientSessionFromListEntry(session)]));
+    // Pi can fork before the first conversational entry without creating a file.
+    // Enumerate already-hosted runtimes only; listing must not open cold sessions.
+    for (const active of new Set(this.active.values())) {
+      const session = active.runtime.session;
+      if (!cwdPathsEqual(session.sessionManager.getCwd(), cwd) || archivedById.has(session.sessionId) || unarchivedById.has(session.sessionId)) continue;
+      unarchivedById.set(session.sessionId, clientSessionFromActiveSession(session));
+    }
+    const unarchivedSessions = [...unarchivedById.values()].sort((a, b) => Date.parse(b.modified) - Date.parse(a.modified));
     const reconcilableSessionIds = this.reconcilableSessionIds(cwd, unarchivedSessions.map((session) => session.id), archivedById);
     this.workspaceActivity?.reconcileSessionActivity(cwd, reconcilableSessionIds);
     await this.publishUnreadMutations(this.unreadStore.reconcileCwd(canonicalizeStoredCwd(cwd), reconcilableSessionIds));
@@ -1584,16 +1588,8 @@ export class PiSessionService implements SessionRouteService {
   ): ClientSession {
     const { session } = active.runtime;
     const created: ClientSession = {
-      id: session.sessionId,
-      path: session.sessionFile ?? "",
+      ...clientSessionFromActiveSession(session),
       cwd,
-      persisted: sessionFileExists(session.sessionFile),
-      created: new Date().toISOString(),
-      modified: new Date().toISOString(),
-      messageCount: session.messages.length,
-      firstMessage: "",
-      // Include the parent so listeners can nest the new session in the tree
-      // immediately, instead of showing it flat until the next reload.
       ...(parentSession === undefined ? {} : { parentSessionPath: parentSession }),
     };
     // Broadcast so other clients (and the spawning agent's UI) can add the new
@@ -1965,12 +1961,6 @@ export class PiSessionService implements SessionRouteService {
         : AbortSignal.any([opts.signal, startupSignal]);
     // A pre-aborted signal dismisses the dialog before it ever opens.
     if (signal?.aborted === true) return extensionDialogCancelValue(request.kind);
-    const replacement = this.extensionCommandExecution.getStore()?.replacement;
-    if (replacement?.active === true && replacement.result?.session.id === session.sessionId) {
-      // A callback dialog must be answerable before the callback can finish.
-      // Joining the announced session recovers this dialog from its status.
-      this.publishExtensionReplacement(replacement);
-    }
     const timeoutMs = effectiveExtensionDialogTimeoutMs(opts?.timeout, this.extensionDialogsTimeoutMs);
     const dialog = this.pendingExtensionDialogStore.open({
       sessionId: session.sessionId,
@@ -2983,6 +2973,8 @@ export class PiSessionService implements SessionRouteService {
         }
       }
 
+      this.setSuggestedInput(session.sessionId, result.editorText);
+      this.events.publish(session.sessionId, { type: "session.tree.changed" });
       if (this.isCurrentActiveSession(session)) this.publishActivity(session, "session tree navigated", "idle");
       return { cancelled: false, ...(result.editorText === undefined ? {} : { editorText: result.editorText }) };
     } catch (error: unknown) {
@@ -3045,6 +3037,8 @@ export class PiSessionService implements SessionRouteService {
         return { cancelled: true };
       }
 
+      this.setSuggestedInput(result.session.id, result.promptDraft);
+      this.events.publish(session.sessionId, { type: "session.tree.changed" });
       const forkedSession = this.active.get(result.session.id)?.runtime.session;
       if (forkedSession !== undefined && this.isCurrentActiveSession(forkedSession)) {
         this.publishActivity(forkedSession, "session forked", "idle");
@@ -3555,6 +3549,7 @@ export class PiSessionService implements SessionRouteService {
     const pendingOpens = this.pendingSessionOpenPromises(sessionId);
     if (pendingOpens.length > 0) await Promise.allSettled(pendingOpens);
     const active = this.active.get(sessionId);
+    this.suggestedInputs.delete(sessionId);
     if (notificationPolicy.kind === "clear") {
       const generation = active === undefined ? undefined : this.notificationGenerationBySession.get(active.runtime.session);
       const mutations = generation === undefined
@@ -3893,7 +3888,12 @@ export class PiSessionService implements SessionRouteService {
           // holds for this session; settle those waits before the new
           // runtime's extensions can open fresh dialogs under the same id.
           this.endSessionExtensionDialogs(boundSession.sessionId);
+          const changedIdentity = boundSession.sessionId !== session.sessionId;
           boundSession = session;
+          // Publish existence as soon as status/dialog APIs can address it,
+          // before session_start or arbitrary withSession code can park on a question.
+          this.startupSessions.set(session.sessionId, session);
+          if (changedIdentity) this.announceCreatedSession(active, session.sessionManager.getCwd());
           await this.bindSessionExtensions(session, candidateGeneration);
           if (candidateGeneration !== undefined) {
             this.publishNotificationMutations(this.notificationStore.commitReplacement(candidateGeneration));
@@ -3993,12 +3993,6 @@ export class PiSessionService implements SessionRouteService {
         const expectedLeafId = session.sessionManager.getLeafId();
         return this.runExtensionSessionControl(session, async () => {
           const result = await this.navigateSessionTree(ref, targetId, expectedLeafId, options ?? { summarize: false }, session);
-          if (!result.cancelled) {
-            const replacement = this.extensionCommandExecution.getStore()?.replacement;
-            if (replacement?.active === true && replacement.result?.session.id === ref.id) {
-              replacement.result = { ...replacement.result, promptDraft: result.editorText ?? "" };
-            } else this.events.publish(ref.id, { type: "session.tree.navigated", result });
-          }
           return { cancelled: result.cancelled };
         });
       },
@@ -4016,40 +4010,26 @@ export class PiSessionService implements SessionRouteService {
             return Promise.resolve();
           } }),
         };
-        return this.runExtensionSessionControl(session, () => {
-          const execution = this.extensionCommandExecution.getStore();
-          let inherited = execution?.replacement?.active === true ? execution.replacement : undefined;
-          let replacement: ExtensionSessionReplacement = inherited ?? { active: true, channelId: ref.id };
-          // A callback may navigate or fork again before browsers can subscribe
-          // to the replacement. Send one final outcome on the original channel,
-          // including any draft changes, even if post-replacement code fails.
-          const controlExecution = { ...execution, replacement };
-          return this.extensionCommandExecution.run(controlExecution, async () => {
-            let callbackError: string | undefined;
+        return this.runExtensionSessionControl(session, async () => {
+          const runtime = this.active.get(ref.id)?.runtime;
+          const result = await this.forkSessionTree(ref, { entryId, expectedLeafId }, forkOptions, session);
+          if (!result.cancelled) {
             try {
-              const result = await this.forkSessionTree(ref, { entryId, expectedLeafId }, forkOptions, session);
-              if (!result.cancelled) {
-                // Detached work may have started before its parent's scope
-                // expired, but committed afterward. It now owns its handoff.
-                if (inherited !== undefined && !inherited.active) {
-                  inherited = undefined;
-                  replacement = { active: true, channelId: ref.id };
-                  controlExecution.replacement = replacement;
-                }
-                replacement.result = result;
-                await completeReplacement?.();
-              }
-              return { cancelled: result.cancelled };
+              await completeReplacement?.();
             } catch (error: unknown) {
-              callbackError = error instanceof Error ? error.message : String(error);
-              throw error;
-            } finally {
-              if (inherited === undefined) {
-                replacement.active = false;
-                this.publishExtensionReplacement(replacement, callbackError);
+              // The fork is committed. Report callback failure on the current
+              // runtime (which may have forked again), including its recoverable inbox.
+              const current = runtime?.session;
+              if (current !== undefined && this.isCurrentActiveSession(current)) {
+                const message = errorMessage(error);
+                current.extensionRunner.getUIContext().notify(message, "error");
+                this.publishActivity(current, "extension callback failed", "error", message);
+                this.events.publish(current.sessionId, { type: "session.error", message });
               }
+              throw error;
             }
-          });
+          }
+          return { cancelled: result.cancelled };
         });
       },
       reload: () => this.runExtensionSessionControl(session, () => this.reloadSessionRuntime(session)),
@@ -4060,20 +4040,9 @@ export class PiSessionService implements SessionRouteService {
     };
   }
 
-  private publishExtensionReplacement(replacement: ExtensionSessionReplacement, error?: string): void {
-    const result = replacement.result;
-    if (result !== undefined && result !== replacement.announcedResult) {
-      this.events.publish(replacement.channelId, {
-        type: "session.tree.forked", result, ...(error === undefined ? {} : { error }),
-      });
-      // Subsequent control effects use the replacement's live subscription.
-      // Like other extension UI effects, they are not replayed across a
-      // disconnect during handoff; durable conversation history remains intact.
-      replacement.channelId = result.session.id;
-      replacement.announcedResult = result;
-    } else if (error !== undefined) {
-      this.events.publish(replacement.channelId, { type: "session.error", message: error });
-    }
+  private setSuggestedInput(sessionId: string, text: string | undefined): void {
+    if (text === undefined || text === "") this.suggestedInputs.delete(sessionId);
+    else this.suggestedInputs.set(sessionId, text);
   }
 
   private assertCurrentExtensionSession(session: PiAgentSession): void {
@@ -4323,6 +4292,7 @@ export class PiSessionService implements SessionRouteService {
           this.events.publish(session.sessionId, { type: "session.error", message });
         });
       }
+      if (eventType === "message_start" && getString(message, "role") === "user") this.suggestedInputs.delete(session.sessionId);
       if (eventType === "agent_end") this.abortRunScopedExtensionDialogs(session.sessionId);
       if (eventType === "compaction_end") this.scheduleCompactionQueueDrain(session.sessionId);
       if (eventType === "agent_start" || eventType === "agent_end") this.scheduleCompactionQueueDrain(session.sessionId);
@@ -4742,6 +4712,7 @@ export class PiSessionService implements SessionRouteService {
     const warnings = this.warningsForSession(session);
     const pendingAsk = this.pendingAskStore.pendingAsk(session.sessionId);
     const pendingDialogs = this.pendingExtensionDialogStore.pendingDialogs(session.sessionId);
+    const suggestedInput = this.suggestedInputs.get(session.sessionId);
     return {
       sessionId: session.sessionId,
       persisted: sessionFileExists(session.sessionFile),
@@ -4759,6 +4730,7 @@ export class PiSessionService implements SessionRouteService {
       ...(warnings.length === 0 ? {} : { warnings }),
       ...(pendingAsk === undefined ? {} : { pendingAsk }),
       ...(pendingDialogs.length === 0 ? {} : { pendingDialogs }),
+      ...(suggestedInput === undefined ? {} : { suggestedInput }),
     };
   }
 
@@ -4875,6 +4847,23 @@ function notificationIdentityForSession(session: PiAgentSession): { sessionId: s
   return {
     sessionId: session.sessionId,
     cwd: canonicalizeStoredCwd(session.sessionManager.getCwd()),
+  };
+}
+
+function clientSessionFromActiveSession(session: PiAgentSession): ClientSession {
+  const header = session.sessionManager.getHeader?.();
+  const created = header?.timestamp ?? new Date().toISOString();
+  return {
+    id: session.sessionId,
+    path: session.sessionFile ?? "",
+    cwd: session.sessionManager.getCwd(),
+    persisted: sessionFileExists(session.sessionFile),
+    created,
+    modified: created,
+    messageCount: session.messages.length,
+    firstMessage: "",
+    ...(session.sessionName === undefined ? {} : { name: session.sessionName }),
+    ...(header?.parentSession === undefined ? {} : { parentSessionPath: header.parentSession }),
   };
 }
 

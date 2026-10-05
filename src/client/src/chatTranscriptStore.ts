@@ -27,6 +27,7 @@ const browserChatHistoryCache: ChatHistoryCacheAdapter = {
 
 export class ChatTranscriptStore {
   private readonly rawHistoryPages = new Map<string, RawMessagePage>();
+  private readonly historyRevisions = new Map<string, number>();
 
   constructor(private readonly cache: ChatHistoryCacheAdapter = browserChatHistoryCache) {}
 
@@ -54,7 +55,13 @@ export class ChatTranscriptStore {
     return seedStreamingPartial(messages, partial);
   }
 
+  /** Reads started before a branch invalidation must not repopulate its cache. */
+  historyRevision(sessionId: string): number {
+    return this.historyRevisions.get(sessionId) ?? 0;
+  }
+
   discard(sessionId: string): void {
+    this.historyRevisions.set(sessionId, this.historyRevision(sessionId) + 1);
     this.rawHistoryPages.delete(sessionId);
     this.cache.remove?.(sessionId);
   }

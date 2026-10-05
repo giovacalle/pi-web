@@ -570,6 +570,7 @@ export function parseSessionStatus(value: unknown): SessionStatus {
     ...optionalWarnings(record["warnings"]),
     ...optionalPendingAsk(record["pendingAsk"]),
     ...optionalPendingDialogs(record["pendingDialogs"]),
+    ...optionalField("suggestedInput", optionalString(record, "suggestedInput")),
   };
 }
 
@@ -763,10 +764,8 @@ export function parseSessionStreamEvent(value: unknown): SessionUiEvent {
       return parseSessionNameEvent(record);
     case "session.created":
       return { type: "session.created", session: parseSessionInfo(record["session"]) };
-    case "session.tree.navigated":
-      return { type: "session.tree.navigated", result: parseSessionTreeNavigateResult(record["result"]) };
-    case "session.tree.forked":
-      return { type: "session.tree.forked", result: parseSessionTreeForkResult(record["result"]), ...optionalField("error", optionalString(record, "error")) };
+    case "session.tree.changed":
+      return { type: "session.tree.changed" };
     case "pi.event":
       return { type: "pi.event", eventType: requireString(record, "eventType") };
     default:

@@ -39,12 +39,12 @@ type CommandAction = (ctx: ExtensionCommandContext) => Promise<unknown>;
 
 // Real resource loader, ExtensionRunner, persistent tree and AgentSessionRuntime.
 // Only configuration/model access and extension-owned workflow controls are isolated.
-async function fixture() {
+async function fixture(options: { rootUser?: boolean } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "pi-web-extension-commands-"));
   const agentDir = join(directory, "agent");
   const sessionDir = join(directory, "sessions");
-  const controls: { input?: ReturnType<typeof gate>; tree?: ReturnType<typeof gate>; fork?: ReturnType<typeof gate>; cancelTree: boolean; cancelFork: boolean } = {
-    cancelTree: false, cancelFork: false,
+  const controls: { input?: ReturnType<typeof gate>; tree?: ReturnType<typeof gate>; fork?: ReturnType<typeof gate>; cancelTree: boolean; cancelFork: boolean; forkStartupDialog: boolean } = {
+    cancelTree: false, cancelFork: false, forkStartupDialog: false,
   };
   const cleanup: { service?: PiSessionService } = {};
   onTestFinished(async () => {
@@ -55,14 +55,16 @@ async function fixture() {
     finally { await rm(directory, { recursive: true, force: true }); }
   });
   const manager = SessionManager.create(directory, sessionDir);
-  manager.appendModelChange(testModel().provider, testModel().id);
-  manager.appendThinkingLevelChange("off");
-  manager.appendSessionInfo("Extension command regression");
-  manager.appendMessage({ role: "user", content: "Initial question", timestamp: 1 });
-  const earlier = manager.appendMessage(assistant("Earlier answer"));
+  if (options.rootUser !== true) {
+    manager.appendModelChange(testModel().provider, testModel().id);
+    manager.appendThinkingLevelChange("off");
+    manager.appendSessionInfo("Extension command regression");
+    manager.appendMessage({ role: "user", content: "Initial question", timestamp: 1 });
+  }
   const draftText = "Edit this question\nwith its original text";
+  const earlier = options.rootUser === true ? undefined : manager.appendMessage(assistant("Earlier answer"));
   const draft = manager.appendMessage({ role: "user", content: [{ type: "text", text: draftText }], timestamp: 2 });
-  const latest = manager.appendMessage(assistant("Later answer"));
+  const latest = options.rootUser === true ? draft : manager.appendMessage(assistant("Later answer"));
   const originalFile = manager.getSessionFile();
   if (originalFile === undefined) throw new Error("Fixture must have a persistent session file");
 
@@ -70,8 +72,16 @@ async function fixture() {
   const modelCall = vi.fn(() => { throw new Error("Extension commands must not call a model"); });
   onTestFinished(() => { expect(modelCall).not.toHaveBeenCalled(); });
   const sessionEvents = new PiSessionEventConnections();
+  // No realtime subscriber: discovery, dialogs and drafts must work by reads alone.
   const hub = new CapturingSessionEventHub();
+  const addSocket = vi.spyOn(hub, "add");
+  const addGlobalSocket = vi.spyOn(hub, "addGlobal");
+  onTestFinished(() => {
+    expect(addSocket).not.toHaveBeenCalled();
+    expect(addGlobalSocket).not.toHaveBeenCalled();
+  });
   const starts: { id: string; generation: number; reason: string }[] = [];
+  const startupDialogs: { id: string; announcedBeforeStart: boolean; accepted?: boolean }[] = [];
   let generation = 0;
   let current: AgentSession | undefined;
   let pending: { action: CommandAction; complete: (outcome: CommandOutcome) => void } | undefined;
@@ -92,7 +102,15 @@ async function fixture() {
           agentsFilesOverride: () => ({ agentsFiles: [] }),
           extensionFactories: [(pi) => {
             const loaded = ++generation;
-            pi.on("session_start", (event, ctx) => { starts.push({ id: ctx.sessionManager.getSessionId(), generation: loaded, reason: event.reason }); });
+            pi.on("session_start", async (event, ctx) => {
+              const id = ctx.sessionManager.getSessionId();
+              starts.push({ id, generation: loaded, reason: event.reason });
+              if (event.reason === "fork" && controls.forkStartupDialog) {
+                const dialog: (typeof startupDialogs)[number] = { id, announcedBeforeStart: hub.globalEvents.some((item) => item.type === "session.created" && item.session.id === id) };
+                startupDialogs.push(dialog);
+                dialog.accepted = await ctx.ui.confirm("Start this fork?", "Answer when a client joins later");
+              }
+            });
             pi.on("session_before_tree", async () => {
               const held = controls.tree;
               held?.entered.resolve();
@@ -159,11 +177,11 @@ async function fixture() {
       return await completion.promise;
     } finally { connection.close(); }
   }
-  return { service: hosted, hub, manager, controls, session, ref, run, starts, earlier, draft, latest, draftText, originalFile };
+  return { service: hosted, hub, manager, controls, session, ref, run, starts, startupDialogs, diskList: list, earlier: earlier ?? draft, draft, latest, draftText, originalFile };
 }
 
 describe("hosted ExtensionCommandContext actions with native Pi", () => {
-  it("navigates real agent context through runCommand and pi.events -> sendUserMessage, publishing the draft on the original socket", async () => {
+  it("navigates real agent context through runCommand and pi.events -> sendUserMessage, retaining drafts for later status reads", async () => {
     const f = await fixture();
     const originalId = f.session().sessionId;
     const entries = structuredClone(f.manager.getEntries());
@@ -173,17 +191,22 @@ describe("hosted ExtensionCommandContext actions with native Pi", () => {
     expect(f.manager.getLeafId()).toBe(f.earlier);
     expect(f.session().agent.state.messages).toEqual(f.manager.buildSessionContext().messages);
     expect(f.session().messages).not.toContainEqual(assistant("Later answer"));
-    expect(f.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.navigated")).toEqual([
-      { sessionId: originalId, event: { type: "session.tree.navigated", result: { cancelled: false } } },
+    expect(f.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.changed")).toEqual([
+      { sessionId: originalId, event: { type: "session.tree.changed" } },
     ]);
+    expect(await f.service.status(f.ref())).not.toHaveProperty("suggestedInput");
 
     await expect(f.run((ctx) => ctx.navigateTree(f.draft), true)).resolves.toEqual({ result: { cancelled: false } });
     expect(f.manager.getLeafId()).toBe(f.earlier);
     expect(f.session().agent.state.messages).toEqual(f.manager.buildSessionContext().messages);
     expect(f.session().messages).not.toContainEqual(expect.objectContaining({ role: "user", content: [{ type: "text", text: f.draftText }] }));
-    expect(f.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.navigated").at(-1)).toEqual({
-      sessionId: originalId, event: { type: "session.tree.navigated", result: { cancelled: false, editorText: f.draftText } },
-    });
+    expect(f.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.changed")).toEqual([
+      { sessionId: originalId, event: { type: "session.tree.changed" } },
+      { sessionId: originalId, event: { type: "session.tree.changed" } },
+    ]);
+    expect(await f.service.status(f.ref())).toHaveProperty("suggestedInput", f.draftText);
+    expect((await f.service.transcriptSnapshot(f.ref())).status).toHaveProperty("suggestedInput", f.draftText);
+    expect(await f.service.runCommand(f.ref(), "/tree")).toMatchObject({ type: "tree", tree: { activeLeafId: f.earlier } });
     expect(f.manager.getEntries()).toEqual(entries);
     expect(f.session().sessionId).toBe(originalId);
     expect(f.service.activeCount()).toBe(1);
@@ -201,6 +224,11 @@ describe("hosted ExtensionCommandContext actions with native Pi", () => {
         expect(fresh === ctx).toBe(false);
         freshId = fresh.sessionManager.getSessionId();
         expect(freshId).not.toBe(original.sessionId);
+        expect(fresh.sessionManager.getSessionName()).toBe("Extension command regression — Fork 1");
+        expect(await f.service.list(f.ref().cwd)).toContainEqual(expect.objectContaining({ id: freshId }));
+        const status = await f.service.status(f.ref());
+        if (position === "before") expect(status).toHaveProperty("suggestedInput", f.draftText);
+        else expect(status).not.toHaveProperty("suggestedInput");
         const branch = fresh.sessionManager.getBranch().map((entry) => entry.id);
         expect(branch).toContain(f.earlier);
         if (position === "before") expect(branch).not.toContain(f.draft);
@@ -222,23 +250,23 @@ describe("hosted ExtensionCommandContext actions with native Pi", () => {
     expect(await readFile(f.originalFile, "utf8")).toBe(originalBytes);
     expect(original.sessionManager.getEntries()).toEqual(originalEntries);
     expect(original.sessionManager.getLeafId()).toBe(f.latest);
-    const forkEvents = f.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.forked");
-    expect(forkEvents).toHaveLength(1);
-    const [forkEvent] = forkEvents;
-    expect(forkEvent?.sessionId).toBe(original.sessionId);
-    if (forkEvent?.event.type !== "session.tree.forked") throw new Error("Missing fork result event");
-    expect(forkEvent.event.result).toMatchObject({
-      cancelled: false, session: { id: freshId, path: forked.sessionFile, parentSessionPath: f.originalFile },
-    });
-    if (position === "before") expect(forkEvent.event.result).toHaveProperty("promptDraft", f.draftText);
-    else expect(forkEvent.event.result).not.toHaveProperty("promptDraft");
+    expect(f.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.changed")).toEqual([
+      { sessionId: original.sessionId, event: { type: "session.tree.changed" } },
+    ]);
+    expect(await f.service.list(f.ref().cwd)).toContainEqual(expect.objectContaining({
+      id: freshId, path: forked.sessionFile, parentSessionPath: f.originalFile,
+      name: "Extension command regression — Fork 1",
+    }));
+    const status = await f.service.status(f.ref());
+    if (position === "before") expect(status).toHaveProperty("suggestedInput", f.draftText);
+    else expect(status).not.toHaveProperty("suggestedInput");
     expect(f.service.activeCount()).toBe(1);
     // Real setRebindSession installs working command actions on the replacement.
     await expect(f.run((ctx) => ctx.navigateTree(f.earlier))).resolves.toEqual({ result: { cancelled: false } });
     expect(forked.sessionManager.getLeafId()).toBe(f.earlier);
   });
 
-  it("coalesces nested replacement controls into the final identity and draft on the original channel", async () => {
+  it("makes every nested fork discoverable and retains the current tree and latest suggestion without clients", async () => {
     const f = await fixture();
     const originalId = f.session().sessionId;
     let firstId: string | undefined;
@@ -247,10 +275,13 @@ describe("hosted ExtensionCommandContext actions with native Pi", () => {
       position: "at",
       withSession: async (fresh) => {
         firstId = fresh.sessionManager.getSessionId();
+        expect(fresh.sessionManager.getSessionName()).toBe("Extension command regression — Fork 1");
         await fresh.fork(f.draft, {
           position: "at",
           withSession: async (next) => {
             finalId = next.sessionManager.getSessionId();
+            expect(next.sessionManager.getSessionName()).toBe("Extension command regression — Fork 2");
+            expect(() => fresh.sessionManager.getLeafId()).toThrow("stale");
             await next.navigateTree(f.draft);
           },
         });
@@ -258,44 +289,81 @@ describe("hosted ExtensionCommandContext actions with native Pi", () => {
     }))).resolves.toEqual({ result: { cancelled: false } });
     expect(finalId).not.toBe(firstId);
     expect(f.session().sessionId).toBe(finalId);
-    expect(f.session().sessionManager.getLeafId()).toBe(f.earlier);
-    expect(f.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.navigated")).toEqual([]);
-    const events = f.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.forked");
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ sessionId: originalId,
-      event: { result: { cancelled: false, session: { id: finalId }, promptDraft: f.draftText } },
-    });
+    const discovered = await f.service.list(f.ref().cwd);
+    expect(discovered.map(({ id }) => id)).toEqual(expect.arrayContaining([originalId, firstId, finalId]));
+    expect(new Set(discovered.map(({ id }) => id)).size).toBe(discovered.length);
+    expect(await f.service.runCommand(f.ref(), "/tree")).toMatchObject({ type: "tree", tree: { activeLeafId: f.earlier } });
+    expect(await f.service.status(f.ref())).toHaveProperty("suggestedInput", f.draftText);
+    expect(f.session().agent.state.messages).toEqual(f.session().sessionManager.buildSessionContext().messages);
+    expect((await f.service.messages(f.ref())).messages).not.toContainEqual(expect.objectContaining({ role: "user", content: [{ type: "text", text: f.draftText }] }));
+    expect(f.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.changed")).toEqual([
+      { sessionId: originalId, event: { type: "session.tree.changed" } },
+      { sessionId: firstId, event: { type: "session.tree.changed" } },
+      { sessionId: finalId, event: { type: "session.tree.changed" } },
+    ]);
+    expect(f.service.activeCount()).toBe(1);
   });
 
-  it("hands off a replacement before waiting for its browser dialog and follows later callback navigation", async () => {
-    const f = await fixture();
+  it("discovers an unpersisted fork before the root user entry while session_start waits for a delayed client, without a handoff", async () => {
+    const f = await fixture({ rootUser: true });
     const originalId = f.session().sessionId;
+    const cwd = f.ref().cwd;
+    // A metadata entry before this user would take the persisted-branch SDK path instead.
+    expect(f.manager.getEntries()[0]).toMatchObject({ id: f.draft, parentId: null, type: "message", message: { role: "user" } });
+    f.controls.forkStartupDialog = true;
     let accepted: boolean | undefined;
+    let settled = false;
     const operation = f.run((ctx) => ctx.fork(f.draft, {
-      position: "at",
       withSession: async (fresh) => {
+        expect(fresh.sessionManager.getSessionName()).toContain("— Fork 1");
+        expect(() => ctx.sessionManager.getLeafId()).toThrow("stale");
         accepted = await fresh.ui.confirm("Continue fork?", "Confirm the replacement workflow");
-        await fresh.navigateTree(f.draft);
       },
-    }));
-    await vi.waitFor(() => {
-      expect(f.hub.sessionEvents.some(({ sessionId, event }) => sessionId === originalId && event.type === "session.tree.forked")).toBe(true);
+    })).then((outcome) => { settled = true; return outcome; });
+
+    // A client arrives after the operation has parked. It uses only list/status/answer APIs.
+    const discovered = await vi.waitFor(async () => {
+      const forked = (await f.service.list(cwd)).find(({ id }) => id !== originalId);
+      if (forked === undefined) throw new Error("Fork is not yet discoverable");
+      return forked;
     });
-    const status = await f.service.status(f.ref());
-    const dialog = status.pendingDialogs?.[0];
-    if (dialog === undefined) throw new Error("Replacement dialog must be recoverable from its announced session");
-    expect(dialog.title).toBe("Continue fork?");
-    await f.service.answerDialog(f.ref(), dialog.dialogId, true);
+    const forkRef = { id: discovered.id, cwd: discovered.cwd };
+    const startup = await vi.waitFor(async () => {
+      const dialog = (await f.service.status(forkRef)).pendingDialogs?.[0];
+      if (dialog?.title !== "Start this fork?") throw new Error("Missing recoverable session_start dialog");
+      return dialog;
+    });
+    expect(f.startupDialogs).toEqual([{ id: discovered.id, announcedBeforeStart: true }]);
+    expect((await f.diskList()).map(({ id }) => id)).not.toContain(discovered.id);
+    await expect(readFile(discovered.path, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(settled).toBe(false);
+    expect(f.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.changed")).toEqual([]);
+    expect(await f.service.status(forkRef)).toMatchObject({ sessionId: discovered.id, persisted: false });
+    expect(f.starts).toHaveLength(2);
+    await f.service.answerDialog(forkRef, startup.dialogId, true);
+
+    const callback = await vi.waitFor(async () => {
+      const dialog = (await f.service.status(forkRef)).pendingDialogs?.[0];
+      if (dialog?.title !== "Continue fork?") throw new Error("Callback dialog is not yet open");
+      return dialog;
+    });
+    expect(f.startupDialogs[0]?.accepted).toBe(true);
+    expect(settled).toBe(false);
+    expect(await f.service.status(forkRef)).toHaveProperty("suggestedInput", f.draftText);
+    await f.service.answerDialog(forkRef, callback.dialogId, true);
     await expect(operation).resolves.toEqual({ result: { cancelled: false } });
     expect(accepted).toBe(true);
-    const events = f.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.forked");
-    expect(events).toHaveLength(2);
-    expect(events[1]).toMatchObject({ sessionId: f.session().sessionId,
-      event: { result: { session: { id: f.session().sessionId }, promptDraft: f.draftText } },
-    });
+    expect(await f.service.status(forkRef)).toMatchObject({ sessionId: discovered.id, persisted: false, suggestedInput: f.draftText });
+    expect((await f.service.status(forkRef)).pendingDialogs ?? []).toEqual([]);
+    expect(await f.service.list(forkRef.cwd)).toContainEqual(expect.objectContaining({ id: discovered.id }));
+    expect((await f.diskList()).map(({ id }) => id)).not.toContain(discovered.id);
+    expect(f.starts).toHaveLength(2); // Reads did not create a second runtime.
+    expect(f.session().sessionManager.getEntries()).not.toContainEqual(expect.objectContaining({ id: f.draft }));
+    expect((await f.service.messages(forkRef)).messages).toEqual([]);
+    expect(f.service.activeCount()).toBe(1);
   });
 
-  it("publishes detached forks that start inside a scope but commit after it expires", async () => {
+  it("keeps detached forks discoverable when they commit after their initiating callback returns", async () => {
     const f = await fixture();
     const held = gate();
     let late: Promise<unknown> | undefined;
@@ -309,23 +377,25 @@ describe("hosted ExtensionCommandContext actions with native Pi", () => {
         await held.entered.promise;
       },
     }))).resolves.toEqual({ result: { cancelled: false } });
-    expect(f.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.forked")).toHaveLength(1);
+    expect(await f.service.list(f.ref().cwd)).toContainEqual(expect.objectContaining({ id: firstId }));
     held.release.resolve();
     await late;
     expect(f.session().sessionId).not.toBe(firstId);
-    const events = f.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.forked");
-    expect(events).toHaveLength(2);
-    expect(events[1]).toMatchObject({ sessionId: firstId, event: { result: { session: { id: f.session().sessionId } } } });
+    expect((await f.service.list(f.ref().cwd)).map(({ id }) => id)).toEqual(expect.arrayContaining([firstId, f.session().sessionId]));
+    expect(f.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.changed")).toEqual([
+      { sessionId: f.manager.getSessionId(), event: { type: "session.tree.changed" } },
+      { sessionId: firstId, event: { type: "session.tree.changed" } },
+    ]);
   });
 
-  it("expires replacement event coalescing before detached callback work runs", async () => {
+  it("retains tree and suggestion changes from a fresh callback after the originating fork resolves", async () => {
     const f = await fixture();
     const released = deferred();
     let late: Promise<unknown> | undefined;
     await expect(f.run((ctx) => ctx.fork(f.draft, {
       position: "at",
       withSession: (fresh) => {
-        late = released.promise.then(() => fresh.navigateTree(f.earlier));
+        late = released.promise.then(() => fresh.navigateTree(f.draft));
         return Promise.resolve();
       },
     }))).resolves.toEqual({ result: { cancelled: false } });
@@ -333,25 +403,49 @@ describe("hosted ExtensionCommandContext actions with native Pi", () => {
     released.resolve();
     await late;
     expect(f.session().sessionManager.getLeafId()).toBe(f.earlier);
-    expect(f.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.navigated")).toEqual([
-      { sessionId: forkedId, event: { type: "session.tree.navigated", result: { cancelled: false } } },
+    expect(await f.service.status(f.ref())).toHaveProperty("suggestedInput", f.draftText);
+    expect(await f.service.runCommand(f.ref(), "/tree")).toMatchObject({ type: "tree", tree: { activeLeafId: f.earlier } });
+    expect(f.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.changed")).toEqual([
+      { sessionId: f.manager.getSessionId(), event: { type: "session.tree.changed" } },
+      { sessionId: forkedId, event: { type: "session.tree.changed" } },
     ]);
   });
 
-  it("publishes the committed fork and callback failure even when post-replacement code throws", async () => {
+  it.each([false, true])("retains committed forks and reports callback failure in the current recoverable inbox (nested=%s)", async (nested) => {
     const f = await fixture();
     const originalId = f.session().sessionId;
     const bytes = await readFile(f.originalFile, "utf8");
+    let firstId: string | undefined;
     await expect(f.run((ctx) => ctx.fork(f.draft, {
-      withSession: () => Promise.reject(new Error("Post-fork workflow failed")),
+      position: nested ? "at" : "before",
+      withSession: async (fresh) => {
+        firstId = fresh.sessionManager.getSessionId();
+        if (nested) await fresh.fork(f.draft);
+        throw new Error("Post-fork workflow failed");
+      },
     }))).resolves.toEqual({ error: "Post-fork workflow failed" });
-    expect(f.session().sessionId).not.toBe(originalId);
+    const currentId = f.session().sessionId;
+    expect(currentId).not.toBe(originalId);
+    if (nested) expect(currentId).not.toBe(firstId);
     expect(await readFile(f.originalFile, "utf8")).toBe(bytes);
-    const events = f.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.forked");
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ sessionId: originalId,
-      event: { result: { cancelled: false, session: { id: f.session().sessionId }, promptDraft: f.draftText }, error: "Post-fork workflow failed" },
-    });
+    expect((await f.service.list(f.ref().cwd)).map(({ id }) => id)).toEqual(expect.arrayContaining([originalId, firstId, currentId]));
+    expect(await f.service.status(f.ref())).toHaveProperty("suggestedInput", f.draftText);
+    const tree = await f.service.runCommand(f.ref(), "/tree");
+    expect(tree).toMatchObject({ type: "tree", tree: { activeLeafId: f.session().sessionManager.getLeafId() } });
+    if (tree.type !== "tree") throw new Error("Committed fork tree is unavailable");
+    expect(tree.tree.activePathIds).toContain(f.earlier);
+    expect(tree.tree.nodes.map(({ id }) => id)).not.toContain(f.draft);
+    const inbox = f.service.notificationInbox(f.ref());
+    expect(inbox.summary).toMatchObject({ sessionId: currentId, retainedCount: 1, highestSeverity: "error" });
+    expect(inbox.notifications).toEqual([expect.objectContaining({ message: "Post-fork workflow failed", severity: "error" })]);
+    expect(f.service.notificationCatalog().sessions).toEqual([
+      expect.objectContaining({ sessionId: currentId, retainedCount: 1, highestSeverity: "error" }),
+    ]);
+    expect(f.hub.sessionEvents.filter(({ event }) => event.type === "session.error")).toEqual([
+      { sessionId: currentId, event: { type: "session.error", message: "Post-fork workflow failed" } },
+    ]);
+    expect(f.hub.sessionEvents.map(({ event }) => event.type)).not.toContain("session.tree.forked");
+    expect(f.service.activeCount()).toBe(1);
   });
 
   it("does not exempt an unrelated hosted mutation and reports native navigation/fork cancellation truthfully", async () => {
@@ -369,11 +463,15 @@ describe("hosted ExtensionCommandContext actions with native Pi", () => {
 
     f.controls.cancelTree = true;
     f.controls.cancelFork = true;
+    const withSession = vi.fn(() => Promise.resolve());
     await expect(f.run((ctx) => ctx.navigateTree(f.earlier))).resolves.toEqual({ result: { cancelled: true } });
-    await expect(f.run((ctx) => ctx.fork(f.draft))).resolves.toEqual({ result: { cancelled: true } });
+    await expect(f.run((ctx) => ctx.fork(f.draft, { withSession }))).resolves.toEqual({ result: { cancelled: true } });
+    expect(withSession).not.toHaveBeenCalled();
     expect(f.manager.getLeafId()).toBe(f.latest);
     expect(f.starts).toHaveLength(1);
-    expect(f.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.navigated" || event.type === "session.tree.forked")).toEqual([]);
+    expect(f.hub.sessionEvents.filter(({ event }) => event.type === "session.tree.changed")).toEqual([]);
+    expect(f.hub.globalEvents.filter((event) => event.type === "session.created")).toHaveLength(1);
+    expect(await f.service.status(f.ref())).not.toHaveProperty("suggestedInput");
     f.controls.cancelTree = false;
     await expect(f.run((ctx) => ctx.navigateTree(f.earlier))).resolves.toEqual({ result: { cancelled: false } });
     expect(f.manager.getLeafId()).toBe(f.earlier);
