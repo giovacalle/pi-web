@@ -576,6 +576,7 @@ export function parseSessionStatus(value: unknown): SessionStatus {
     ...optionalField("warnings", warnings?.filter((warning) => !isLegacyOtherInstanceActivityWarning(warning))),
     ...optionalPendingAsk(record["pendingAsk"]),
     ...optionalPendingDialogs(record["pendingDialogs"]),
+    ...optionalField("suggestedInput", optionalString(record, "suggestedInput")),
   };
 }
 
@@ -769,6 +770,8 @@ export function parseSessionStreamEvent(value: unknown): SessionUiEvent {
       return parseSessionNameEvent(record);
     case "session.created":
       return { type: "session.created", session: parseSessionInfo(record["session"]) };
+    case "session.tree.changed":
+      return { type: "session.tree.changed" };
     case "pi.event":
       return { type: "pi.event", eventType: requireString(record, "eventType") };
     default:
