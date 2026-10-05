@@ -318,7 +318,7 @@ Model lists are shared daemon-wide state. If extensions in two workspaces regist
 
 #### Provider decisions in the daemon log
 
-Check the session-daemon log for `PROVIDER_MUTATION_IGNORED` entries and applied model-list refreshes; these do not produce browser notifications or session warnings. Ignored mutations include the provider ID, operation, reason, and recovery guidance, never provider configuration or credentials. New extension registrations absent from the startup baseline and definite configuration changes are warnings. Fresh callback or native-provider replays remain informational because their implementation cannot be compared reliably; unchanged config replays are silent. Diagnostics are deduplicated per operation/provider/reason so a replay cannot suppress a later configuration warning. See [provider extension troubleshooting](https://pi-web.dev/faq#provider-extension-no-effect) for log commands and recovery steps.
+Provider decisions are recorded in daemon logs, not browser notifications. Entries omit provider configuration and credentials. See [provider extension troubleshooting](https://pi-web.dev/faq#provider-extension-no-effect) for ignored changes.
 
 This prevents accidental provider, configuration, or credential contamination between projects; it is not a security boundary because Pi extensions remain trusted daemon code.
 

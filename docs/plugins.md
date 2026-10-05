@@ -201,7 +201,7 @@ Use **Settings → Pi packages** to install, update, or remove a package. Enter 
 | Install or edit a browser-only plugin | Reload the browser page |
 | Install, update, configure, enable, or disable a server-backed plugin | Restart the target session daemon, then reload the browser |
 | Change ordinary Pi resources such as extensions, skills, or prompts | Run `/reload` in each idle session |
-| Change an extension that registers model providers | Follow the separate [provider restart guidance](https://pi-web.dev/config#pi-extension-provider-baseline); if it loads but has no effect, see [provider extension troubleshooting](https://pi-web.dev/faq#provider-extension-no-effect) |
+| Change an extension that registers model providers | Follow the separate [provider restart guidance](https://pi-web.dev/config#pi-extension-provider-baseline) |
 
 **Restarting the session daemon may interrupt active sessions and terminals.** Inspect active work first and restart from outside the sessions it hosts. For the native systemd user install:
 
