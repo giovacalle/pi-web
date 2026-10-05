@@ -321,7 +321,7 @@ Model lists are shared daemon-wide state. If extensions in two workspaces regist
 
 #### Provider decisions in the daemon log
 
-Check the session-daemon log for ignored provider changes and applied model-list refreshes; these do not produce browser notifications. Log entries omit provider configuration and credentials.
+Provider decisions are recorded in daemon logs, not browser notifications. Entries omit provider configuration and credentials. See [provider extension troubleshooting](https://pi-web.dev/faq#provider-extension-no-effect) for ignored changes.
 
 This prevents accidental provider, configuration, or credential contamination between projects; it is not a security boundary because Pi extensions remain trusted daemon code.
 
