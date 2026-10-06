@@ -1,6 +1,6 @@
 import { html, svg } from "lit";
-import type { ContentRenderRequest, MessageActionAvailabilityContext, MessageActionContext, PluginSelectionSnapshot } from "../../../plugin-api";
-import { availableMessageActions, type RegisteredMessageAction } from "./messageActions";
+import type { ContentRenderRequest, DisplayedMessageActionAvailabilityContext, DisplayedMessageActionContext, MessageActionAvailabilityContext, MessageActionContext, MessageActionResult, PluginSelectionSnapshot } from "../../../plugin-api";
+import { availableDisplayedMessageActions, availableMessageActions, type RegisteredMessageAction } from "./messageActions";
 import { PluginSelectionHost } from "./selection";
 import { PromptChipStore, type PromptChipTarget } from "../promptChips";
 import type { PluginPromptEditor } from "../../../plugin-api";
@@ -167,11 +167,22 @@ export class PluginRegistry {
     id: string,
     input: MessageActionAvailabilityContext,
     createContext: (binding: WorkspacePluginBinding) => MessageActionContext,
-  ): Promise<void> {
+  ): Promise<MessageActionResult> {
     const actions = this.getMessageActions(input.machine.id).filter((action) => action.id === id);
     const available = availableMessageActions(actions, input)[0];
-    if (available?.enabled !== true) return;
-    await available.action.run(createContext(available.action.binding));
+    if (available?.enabled !== true || available.action.target === "display") return;
+    return available.action.run(createContext(available.action.binding));
+  }
+
+  async runDisplayedMessageAction(
+    id: string,
+    input: DisplayedMessageActionAvailabilityContext,
+    createContext: (binding: WorkspacePluginBinding) => DisplayedMessageActionContext,
+  ): Promise<MessageActionResult> {
+    const actions = this.getMessageActions(input.machine.id).filter((action) => action.id === id);
+    const available = availableDisplayedMessageActions(actions, input)[0];
+    if (available?.enabled !== true || available.action.target !== "display") return;
+    return available.action.run(createContext(available.action.binding));
   }
 
   private readonly actions: RegisteredPluginAction[] = [];

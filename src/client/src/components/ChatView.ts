@@ -3,11 +3,10 @@ import { customElement, property, query, state } from "lit/decorators.js";
 import { repeat } from "lit/directives/repeat.js";
 import { keyed } from "lit/directives/keyed.js";
 import { ChatDisclosureController } from "../chatDisclosure";
-import type { MessageActionAvailabilityContext } from "../../../plugin-api";
-import { messageActionMessage, MessageActionAvailabilityCache, type RegisteredMessageAction } from "../plugins/messageActions";
+import type { DisplayedMessageActionAvailabilityContext, MessageActionAvailabilityContext, MessageActionFeedback, MessageActionResult } from "../../../plugin-api";
+import { displayedMessageActionMessage, messageActionMessage, MessageActionAvailabilityCache, type RegisteredMessageAction } from "../plugins/messageActions";
 import { machineSessionKey } from "../machineKeys";
 import { groupChatMessages, summarizeChatGroup, type ChatGroup } from "../chatGroups";
-import { writeClipboardText } from "../clipboard";
 import { capturePrependScrollAnchor, PREPEND_RESTORE_SETTLE_FRAMES, restorePrependScrollAnchor, type PrependScrollAnchor } from "../chatScrollAnchoring";
 import { shouldRequestEarlierMessages } from "../chatHistoryLoading";
 import { ChatScrollController, distanceFromScrollBottom, findFirstVisibleArticle, isNearScrollBottom, type ChatAnchorScrollPosition, type ChatScrollRestoreResult } from "../chatScrollPosition";
@@ -200,10 +199,15 @@ export class ChatView extends LitElement {
   @property() machineId = "local";
   @property({ attribute: false }) messageActions: readonly RegisteredMessageAction[] = [];
   @property({ attribute: false }) messageActionContext?: Omit<MessageActionAvailabilityContext, "message">;
-  @property({ attribute: false }) onMessageAction?: (input: MessageActionAvailabilityContext, actionId: string) => Promise<void>;
+  @property({ attribute: false }) onMessageAction?: (input: MessageActionAvailabilityContext, actionId: string) => Promise<MessageActionResult>;
+  @property({ attribute: false }) onDisplayedMessageAction?: (input: DisplayedMessageActionAvailabilityContext, actionId: string) => Promise<MessageActionResult>;
   private readonly messageActionAvailability = new MessageActionAvailabilityCache();
   @state() private messageActionPending = false;
-  @state() private messageActionError: { machineId: string; sessionId: string; entryId: string; message: string } | undefined;
+  @state() private displayedMessageActionsPending: ReadonlySet<string> = new Set();
+  @state() private messageActionError: { machineId: string; sessionId: string; key: string; message: string } | undefined;
+  @state() private messageActionFeedback: { machineId: string; sessionId: string; key: string; actionId: string; presentation: MessageActionFeedback } | undefined;
+  private messageActionFeedbackTimer: number | undefined;
+  private messageActionGeneration = 0;
   @property({ type: Number }) messageStart = 0;
   @property({ type: Number }) messageEnd = 0;
   @property({ type: Number }) messageTotal = 0;
@@ -237,7 +241,6 @@ export class ChatView extends LitElement {
   @state() private pinnedToBottom = true;
   @state() private zoomedImage: { src: string; alt: string } | undefined = undefined;
   @state() private expandedMetaKey: string | undefined;
-  @state() private copiedMessageKey: string | undefined;
   @state() private currentConversationIndex: number | undefined;
   @state() private collapsedNotificationTargetKeys: ReadonlySet<string> = new Set();
   @state() private retainedEmptyNotificationTrayTargetKey: string | undefined;
@@ -257,7 +260,6 @@ export class ChatView extends LitElement {
   private groupedMessagesStart = 0;
   private groupedMessagesCache: ChatGroup[] = [];
   private readonly messageMetaCache = new WeakMap<ChatLine, string>();
-  private readonly messageCopyTextCache = new WeakMap<ChatLine, string>();
   private lastScrollTop = 0;
   private lastClientHeight = 0;
   private touchStartY: number | undefined;
@@ -322,6 +324,8 @@ export class ChatView extends LitElement {
     this.scrollController.dispose();
     this.imageLayoutScroll.reset();
     this.releaseImageZoomModal();
+    this.messageActionGeneration += 1;
+    this.clearMessageActionFeedback();
     this.prependRestoreToken += 1;
     if (this.restoreScrollFrame !== undefined) cancelAnimationFrame(this.restoreScrollFrame);
     if (this.loadMoreCheckFrame !== undefined) cancelAnimationFrame(this.loadMoreCheckFrame);
@@ -371,7 +375,12 @@ export class ChatView extends LitElement {
   }
 
   protected override willUpdate(changed: Map<string, unknown>): void {
-    if (changed.has("sessionId") || changed.has("machineId")) this.imageLayoutScroll.reset();
+    if (changed.has("sessionId") || changed.has("machineId")) {
+      this.imageLayoutScroll.reset();
+      this.messageActionGeneration += 1;
+      this.clearMessageActionFeedback();
+      this.messageActionError = undefined;
+    }
     if (changed.has("sessionId")) {
       this.savePreviousSessionScrollPosition(changed.get("sessionId"));
       this.prepareSessionUiState();
@@ -961,39 +970,66 @@ export class ChatView extends LitElement {
   }
 
   private renderMessageActions(message: ChatLine, key: string, source: ChatLine) {
-    const actions = this.messageActionContext === undefined || this.onMessageAction === undefined ? []
-      : this.messageActionAvailability.get(source, this.messageActions, this.messageActionContext, message.role);
-    const canCopy = this.isCopyableMessage(message);
-    if (actions.length === 0 && !canCopy) return null;
-    const copied = this.copiedMessageKey === key;
+    const actions = this.messageActionContext === undefined ? []
+      : this.messageActionAvailability.get(source, this.messageActions, this.messageActionContext, message)
+        .filter(({ action }) => action.target === "display" ? this.onDisplayedMessageAction !== undefined : this.onMessageAction !== undefined);
+    if (actions.length === 0) return null;
+    const feedback = this.messageActionFeedback;
     return html`
       <div class="msg-actions" aria-label="Message actions">
-        ${actions.map(({ action, enabled }) => html`
-          <button type="button" class="msg-action" title=${action.title} aria-label=${action.title} ?disabled=${!enabled || this.messageActionPending} @click=${(event: MouseEvent) => { void this.actOnMessage(source, action.id, event, message.role); }}>${action.icon ?? action.title}</button>
-        `)}
-        ${canCopy ? html`<button type="button" class="msg-action" title=${copied ? "Copied" : "Copy message"} aria-label=${`${copied ? "Copied" : "Copy"} ${message.role} message`} @click=${(event: MouseEvent) => { void this.copyMessage(message, key, event); }}>
-          <span aria-hidden="true">${copied ? "✓" : "⧉"}</span>
-        </button>` : null}
-        ${this.messageActionError?.machineId === this.machineId && this.messageActionError.sessionId === this.sessionId && this.messageActionError.entryId === message.entryId ? html`<span role="alert">${this.messageActionError.message}</span>` : null}
+        ${actions.map(({ action, enabled, ariaLabel }) => {
+          const presentation = feedback?.machineId === this.machineId && feedback.sessionId === this.sessionId && feedback.key === key && feedback.actionId === action.id
+            ? feedback.presentation : undefined;
+          const pending = action.target === "display" ? this.displayedMessageActionsPending.has(this.messageActionKey(key, action.id)) : this.messageActionPending;
+          return html`<button type="button" class="msg-action" title=${presentation?.title ?? action.title} aria-label=${presentation?.ariaLabel ?? presentation?.title ?? ariaLabel} ?disabled=${!enabled || pending} @click=${(event: MouseEvent) => { void this.actOnMessage(source, message, key, action, event); }}>${presentation?.icon ?? action.icon ?? action.title}</button>`;
+        })}
+        ${this.messageActionError?.machineId === this.machineId && this.messageActionError.sessionId === this.sessionId && this.messageActionError.key === key ? html`<span role="alert">${this.messageActionError.message}</span>` : null}
       </div>
     `;
   }
 
-  private async actOnMessage(message: ChatLine, actionId: string, event: MouseEvent, role: ChatLine["role"]): Promise<void> {
+  private messageActionKey(key: string, actionId: string): string {
+    return JSON.stringify([this.machineId, this.sessionId, this.messageActionGeneration, key, actionId]);
+  }
+
+  private async actOnMessage(source: ChatLine, displayed: ChatLine, key: string, action: RegisteredMessageAction, event: MouseEvent): Promise<void> {
     event.stopPropagation();
-    const snapshot = messageActionMessage(message, role);
-    if (this.messageActionPending || snapshot === undefined || this.messageActionContext === undefined || this.onMessageAction === undefined) return;
+    const context = this.messageActionContext;
+    if (context === undefined) return;
+    const pendingKey = this.messageActionKey(key, action.id);
+    if (action.target === "display" ? this.displayedMessageActionsPending.has(pendingKey) : this.messageActionPending) return;
+    const entry = messageActionMessage(source, displayed.role);
+    const onEntry = this.onMessageAction;
+    const onDisplay = this.onDisplayedMessageAction;
+    const run = action.target === "display"
+      ? onDisplay === undefined ? undefined : () => onDisplay({ ...context, message: displayedMessageActionMessage(displayed) }, action.id)
+      : entry === undefined || onEntry === undefined ? undefined : () => onEntry({ ...context, message: entry }, action.id);
+    if (run === undefined) return;
     const sessionId = this.sessionId;
     const machineId = this.machineId;
-    this.messageActionPending = true;
+    const generation = this.messageActionGeneration;
+    if (action.target === "display") this.displayedMessageActionsPending = new Set([...this.displayedMessageActionsPending, pendingKey]);
+    else this.messageActionPending = true;
     this.messageActionError = undefined;
     try {
-      await this.onMessageAction({ ...this.messageActionContext, message: snapshot }, actionId);
+      const presentation = await run();
+      if (presentation !== undefined && this.isConnected && this.messageActionGeneration === generation && this.sessionId === sessionId && this.machineId === machineId) {
+        this.clearMessageActionFeedback();
+        this.messageActionFeedback = { machineId, sessionId, key, actionId: action.id, presentation };
+        this.messageActionFeedbackTimer = window.setTimeout(() => { this.clearMessageActionFeedback(); }, 1200);
+      }
     } catch (error) {
-      if (this.sessionId === sessionId && this.machineId === machineId) this.messageActionError = { machineId, sessionId, entryId: snapshot.entryId, message: error instanceof Error ? error.message : String(error) };
+      if (this.isConnected && this.messageActionGeneration === generation && this.sessionId === sessionId && this.machineId === machineId) this.messageActionError = { machineId, sessionId, key, message: error instanceof Error ? error.message : String(error) };
     } finally {
-      this.messageActionPending = false;
+      if (action.target === "display") this.displayedMessageActionsPending = new Set([...this.displayedMessageActionsPending].filter((item) => item !== pendingKey));
+      else this.messageActionPending = false;
     }
+  }
+
+  private clearMessageActionFeedback(): void {
+    if (this.messageActionFeedbackTimer !== undefined) window.clearTimeout(this.messageActionFeedbackTimer);
+    this.messageActionFeedbackTimer = undefined;
+    this.messageActionFeedback = undefined;
   }
 
   private onMetaKeydown(event: KeyboardEvent, key: string, expanded: boolean) {
@@ -1001,33 +1037,6 @@ export class ChatView extends LitElement {
     event.preventDefault();
     this.expandedMetaKey = expanded ? undefined : key;
   }
-
-  private isCopyableMessage(message: ChatLine): boolean {
-    return (message.role === "user" || message.role === "assistant") && this.messageCopyText(message) !== "";
-  }
-
-  private messageCopyText(message: ChatLine): string {
-    const cached = this.messageCopyTextCache.get(message);
-    if (cached !== undefined) return cached;
-    const text = message.parts
-      .filter((part): part is Extract<ChatPart, { type: "text" }> => part.type === "text")
-      .map((part) => part.text.trim())
-      .filter((partText) => partText !== "")
-      .join("\n\n");
-    this.messageCopyTextCache.set(message, text);
-    return text;
-  }
-
-  private async copyMessage(message: ChatLine, key: string, event: MouseEvent): Promise<void> {
-    event.stopPropagation();
-    const copied = await writeClipboardText(this.messageCopyText(message));
-    if (!copied) return;
-    this.copiedMessageKey = key;
-    window.setTimeout(() => {
-      if (this.copiedMessageKey === key) this.copiedMessageKey = undefined;
-    }, 1200);
-  }
-
 
   private messageMetaLabel(message: ChatLine): string {
     const cached = this.messageMetaCache.get(message);

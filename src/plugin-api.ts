@@ -337,16 +337,57 @@ export interface MessageActionContext extends MessageActionAvailabilityContext {
   };
 }
 
-export interface MessageActionContribution {
+/** Optional successful-action presentation, shown by the host for 1.2 seconds. */
+export interface MessageActionFeedback {
+  readonly title: string;
+  readonly ariaLabel?: string;
+  readonly icon?: TemplateResult;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-invalid-void-type -- Preserve existing void callbacks while allowing opt-in feedback.
+export type MessageActionResult = void | MessageActionFeedback;
+
+interface MessageActionDefinition<AvailabilityContext, Context> {
   id: LocalContributionId;
   title: string;
   icon?: TemplateResult;
+  /** Defaults to title. Synchronous and side-effect-free, like availability checks. */
+  ariaLabel?: (context: AvailabilityContext) => string;
   /** Checks run only when their message/session inputs or active contributions change. No I/O. */
-  visible?: (context: MessageActionAvailabilityContext) => boolean;
-  enabled?: (context: MessageActionAvailabilityContext) => boolean;
+  visible?: (context: AvailabilityContext) => boolean;
+  enabled?: (context: AvailabilityContext) => boolean;
   /** Plugin-defined workflow; the host does not add a confirmation. */
-  run: (context: MessageActionContext) => void | Promise<void>;
+  run: (context: Context) => MaybePromise<MessageActionResult>;
 }
+
+/** Default action target: an identified transcript entry with guarded history helpers. */
+export interface EntryMessageActionContribution extends MessageActionDefinition<MessageActionAvailabilityContext, MessageActionContext> {
+  target?: "entry";
+}
+
+/** The ordinary original text in one displayed header's slice, excluding thinking/tool payloads. */
+export interface DisplayedMessageActionMessage {
+  /** Absent for optimistic or streaming messages. */
+  readonly entryId?: string;
+  readonly role: MessageActionMessage["role"];
+  /** Nonempty original text parts, trimmed individually and joined with blank lines. */
+  readonly text: string;
+}
+
+export interface DisplayedMessageActionAvailabilityContext extends Omit<MessageActionAvailabilityContext, "message"> {
+  readonly message: DisplayedMessageActionMessage;
+}
+
+/** Display-only workflows have no history helpers and can run alongside entry actions. */
+export interface DisplayedMessageActionContext extends Omit<MessageActionContext, "message" | "history"> {
+  readonly message: DisplayedMessageActionMessage;
+}
+
+export interface DisplayedMessageActionContribution extends MessageActionDefinition<DisplayedMessageActionAvailabilityContext, DisplayedMessageActionContext> {
+  target: "display";
+}
+
+export type MessageActionContribution = EntryMessageActionContribution | DisplayedMessageActionContribution;
 
 export interface PluginAction {
   id: LocalContributionId;

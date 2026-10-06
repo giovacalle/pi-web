@@ -1,7 +1,8 @@
 // @vitest-environment happy-dom
 import { render, type TemplateResult } from "lit";
 import { afterEach, expect, it, vi } from "vitest";
-import type { MessageActionContext } from "../../../plugin-api";
+import type { DisplayedMessageActionContext, MessageActionContext } from "../../../plugin-api";
+import * as clipboard from "../clipboard";
 import type { SessionInfo } from "../api";
 import { initialAppState, type AppState } from "../appState";
 import { SessionController } from "../controllers/sessionController";
@@ -28,23 +29,9 @@ afterEach(async () => {
 });
 
 it("connects public plugin callbacks and core history actions to the app's scoped helpers", async () => {
-  // Use the real chat render seam without mounting the shell's unrelated
-  // network/session lifecycles; interactions still use actual DOM buttons.
-  const app = new PiWebApp();
-  apps.push(app);
-  await Reflect.get(app, "builtInPluginsReady");
-  const registry: unknown = Reflect.get(app, "plugins");
-  const controller: unknown = Reflect.get(app, "sessions");
-  const modes: unknown = Reflect.get(app, "verifiedPluginModeByMachine");
-  const renderChat: unknown = Reflect.get(app, "renderChatView");
-  if (!(registry instanceof PluginRegistry) || !(controller instanceof SessionController) || !(modes instanceof Map) || !isRenderChat(renderChat)) {
-    throw new Error("Expected app chat collaborators");
-  }
-  modes.set("local", "recovery-disabled");
-  const state: AppState = { ...initialAppState(), selectedSession: session, messages: [
+  const { app, registry, controller, state, renderChat } = await setupChat([
     { role: "user", entryId: "entry-1", parts: [{ type: "text", text: "Hello" }] },
-  ] };
-  Reflect.set(app, "state", state);
+  ]);
   const history = vi.spyOn(controller, "actOnMessage").mockResolvedValue(undefined);
   let received: MessageActionContext | undefined;
   await registry.register({ id: "notes", plugin: {
@@ -84,6 +71,69 @@ it("connects public plugin callbacks and core history actions to the app's scope
   expect(registry.promptChips.list({ machineId: "local", sessionId: "other" })).toEqual([]);
   expect(registry.promptChips.list({ machineId: "local", sessionId: session.id })).toMatchObject([{ label: "Later" }]);
 });
+
+it("dispatches exact displayed slices through plugins, including streaming messages and shared entry IDs", async () => {
+  const writeText = vi.spyOn(clipboard, "writeClipboardText").mockResolvedValue(true);
+  const { app, registry, controller, state, renderChat } = await setupChat([
+    { role: "assistant", entryId: "shared", parts: [{ type: "thinking", text: "Reasoning" }, { type: "text", text: "  First  ", displayText: "Presentation only" }] },
+    { role: "assistant", entryId: "shared", parts: [{ type: "text", text: "Second" }] },
+    { role: "assistant", parts: [{ type: "text", text: "Streaming" }] },
+  ]);
+  let received: DisplayedMessageActionContext | undefined;
+  await registry.register({ id: "display", plugin: {
+    apiVersion: 4, name: "Display workflows", activate: () => ({ contributions: { messageActions: [{
+      target: "display", id: "inspect", title: "Inspect", visible: ({ message }) => message.text !== "",
+      run: (context) => { received = context; return { title: "Inspected" }; },
+    }] } }),
+  } });
+  const history = vi.spyOn(controller, "actOnMessage").mockResolvedValue(undefined);
+  const paginated = { ...state, messagePageStart: 40, messagePageEnd: 43, messagePageTotal: 43 };
+  Reflect.set(app, "state", paginated);
+  const container = document.createElement("div");
+  document.body.append(container);
+  render(renderChat.call(app, paginated, session), container);
+  const view = container.querySelector<ChatView>("chat-view");
+  if (view === null) throw new Error("Expected chat view");
+  await view.updateComplete;
+  const copies = Array.from(view.renderRoot.querySelectorAll<HTMLButtonElement>('[aria-label="Copy assistant message"]'));
+  expect(copies).toHaveLength(3);
+  for (const [index, text] of ["First", "Second", "Streaming"].entries()) {
+    copies[index]?.click();
+    await vi.waitFor(() => { expect(writeText).toHaveBeenCalledTimes(index + 1); expect(copies[index]?.disabled).toBe(false); });
+    expect(writeText).toHaveBeenLastCalledWith(text);
+  }
+  const inspections = Array.from(view.renderRoot.querySelectorAll<HTMLButtonElement>('[aria-label="Inspect"]'));
+  inspections[2]?.click();
+  await vi.waitFor(() => { expect(received?.message).toEqual({ role: "assistant", text: "Streaming" }); });
+  expect(received).not.toHaveProperty("history");
+  expect(received).not.toHaveProperty("state");
+  expect(received?.projects.machineId).toBe("local");
+  expect(history).not.toHaveBeenCalled();
+  await vi.waitFor(() => { expect(view.renderRoot.querySelector('[aria-label="Inspected"]')).not.toBeNull(); });
+  Reflect.set(app, "state", { ...paginated, selectedSession: { ...session, id: "other" } });
+  copies[0]?.click();
+  await view.updateComplete;
+  expect(writeText).toHaveBeenCalledTimes(3);
+});
+
+async function setupChat(messages: AppState["messages"]) {
+  // Use the real chat render seam without mounting the shell's unrelated
+  // network/session lifecycles; interactions still use actual DOM buttons.
+  const app = new PiWebApp();
+  apps.push(app);
+  await Reflect.get(app, "builtInPluginsReady");
+  const registry: unknown = Reflect.get(app, "plugins");
+  const controller: unknown = Reflect.get(app, "sessions");
+  const modes: unknown = Reflect.get(app, "verifiedPluginModeByMachine");
+  const renderChat: unknown = Reflect.get(app, "renderChatView");
+  if (!(registry instanceof PluginRegistry) || !(controller instanceof SessionController) || !(modes instanceof Map) || !isRenderChat(renderChat)) {
+    throw new Error("Expected app chat collaborators");
+  }
+  modes.set("local", "recovery-disabled");
+  const state: AppState = { ...initialAppState(), selectedSession: session, messages };
+  Reflect.set(app, "state", state);
+  return { app, registry, controller, state, renderChat };
+}
 
 function click(view: ChatView, label: string) {
   actionButton(view, label).click();

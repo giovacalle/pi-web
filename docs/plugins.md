@@ -163,29 +163,39 @@ The promise settles after host restoration, or normally when newer navigation su
 
 ### Message actions
 
-Contribute `messageActions` to put a plugin-defined button beside an identified transcript message. Each action has a plugin-local `id`, a `title` used as its accessible label, an optional Lit `icon`, and a `run(context)` callback. The callback performs your own workflow; it is not a choice from a host operation catalog. PI WEB adds no confirmation. Fork and Go back are core plugin contributions using this same flow, with their existing confirmations. Copy remains independent.
+Contribute `messageActions` to put a plugin-defined button beside a displayed transcript message. Each action has a plugin-local `id`, a `title`, an optional Lit `icon`, and a `run(context)` callback. The callback performs your own workflow; it is not a choice from a host operation catalog. PI WEB adds no confirmation. Fork, Go back, and Copy are core plugin contributions using these generic APIs; Fork and Go back retain their existing confirmations.
 
 ```ts
 return {
   contributions: {
     messageActions: [{
+      target: "display",
       id: "quote",
       title: "Quote in next prompt",
-      visible: ({ message }) => message.role === "user",
+      ariaLabel: ({ message }) => `Quote ${message.role} text in next prompt`,
+      visible: ({ message }) => message.role === "user" && message.text !== "",
       enabled: ({ session }) => !session.archived && !session.pending,
       run: ({ message, prompt }) => {
-        prompt.setChip?.({ id: "quote", label: "Quoted message", text: message.text });
+        if (!prompt.setChip) throw new Error("Update PI WEB to attach text context");
+        prompt.setChip({ id: "quote", label: "Quoted message", text: message.text });
+        return { title: "Quoted", ariaLabel: "Message text attached to next prompt" };
       },
     }],
   },
 };
 ```
 
-`visible` and `enabled` are optional synchronous, side-effect-free checks (both default to true). Their small context contains `machine`, `session` (basic identity plus `archived`, `pending`, and `busy`), and `message` (`entryId`, `role`, and `text`). Role follows the displayed header (including grouped skill reads). Text is the entry's ordinary text parts joined with blank lines, not thinking, image data, or tool payloads. Buttons appear on rendered message headers only for durable entries; optimistic/in-flight messages have no contributed actions. Availability is cached for unchanged historical messages. It is refreshed when the message, these machine/session inputs, or active contributions change, and rechecked at invocation. Do not depend on unrelated mutable plugin state or perform requests in availability callbacks. Streaming an unrelated message does not repeat historical checks, and rendering makes no request per message.
+`target` defaults to `"entry"`, preserving existing behavior: buttons appear on rendered headers only for durable entries, with a required `message.entryId`. Text is the entry's ordinary text parts joined with blank lines, not thinking, image data, or tool payloads. Optimistic/in-flight messages have no entry actions.
 
-`run` receives a fresh message/session snapshot plus `prompt`, `navigate`, and machine-bound `projects`. With a selected workspace it also receives `workspace`, `files`, an optional `terminal`, and any exact package-paired `peer` capabilities. Helpers use the initiating machine/workspace. Navigation defaults to that machine unless explicitly overridden. Prompt chips target the initiating conversation; cursor insertion and reads apply only while it remains selected. `history.fork()` and `history.goBack()` are workflow helpers on the clicked message: they load fresh history and retain guarded tree mutations and initiating-client result/draft behavior. They reject if that conversation is no longer selected or the plugin is unavailable. They do not undo filesystem changes. An action's rejected promise appears beside the message; pending actions temporarily disable contributed buttons, not Copy.
+Use `target: "display"` to act on one displayed header's slice, including optimistic or streaming messages. `message.entryId` is optional and absent before a durable entry exists. `message.text` contains that slice's original ordinary text parts, trimmed individually, with empty parts removed and the rest joined with blank lines; it excludes thinking, image data, and tool payloads, and does not use Markdown-transformed text. Display-action contexts omit `history`. Core Copy uses this target, a role-specific accessible label, and successful-action feedback.
 
-Browser API v4 remains compatible; older hosts may ignore `messageActions`. Update PI WEB to use this contribution point. It does not expose a whole-transcript subscription.
+`visible` and `enabled` are optional synchronous, side-effect-free checks (both default to true). Their small context contains `machine`, `session` (basic identity plus `archived`, `pending`, and `busy`), and `message` (`entryId`, `role`, and `text`, according to the target). Role follows the displayed header (including grouped skill reads). The optional `ariaLabel(context)` callback uses the same inputs and rules; when omitted, the accessible label is `title`. Availability is cached for unchanged historical messages. It is refreshed when the message, these machine/session inputs, or active contributions change, and rechecked at invocation. Do not depend on unrelated mutable plugin state or perform requests in these callbacks. Streaming an unrelated message does not repeat historical checks, and rendering makes no request per message.
+
+`run` receives a fresh message/session snapshot plus `prompt`, `navigate`, and machine-bound `projects`. With a selected workspace it also receives `workspace`, `files`, an optional `terminal`, and any exact package-paired `peer` capabilities. Helpers use the initiating machine/workspace. Navigation defaults to that machine unless explicitly overridden. Prompt chips target the initiating conversation; cursor insertion and reads apply only while it remains selected. For entry actions, `history.fork()` and `history.goBack()` are workflow helpers on the clicked message: they load fresh history and retain guarded tree mutations and initiating-client result/draft behavior. They reject if that conversation is no longer selected or the plugin is unavailable. They do not undo filesystem changes. An action's rejected promise appears beside the message. Pending entry actions temporarily disable other entry-action buttons; display actions, including Core Copy, can run independently alongside them, with only the invoked display-action button disabled while it is pending.
+
+For either target, `run` may return nothing or a `MessageActionFeedback` object, synchronously or through a promise. Feedback requires `title` and optionally supplies `ariaLabel` and a Lit `icon`. The host shows this successful-workflow feedback on the clicked button for **1.2 seconds**, then restores its usual presentation. The feedback's accessible label defaults to its `title`; omitting `icon` retains the action's usual icon or text. Feedback is generic, not limited to copying.
+
+Browser API v4 remains compatible; older hosts may ignore `messageActions`. Update PI WEB to use this contribution point and before relying on `target: "display"`, `ariaLabel`, or feedback. It does not expose a whole-transcript subscription.
 
 ### Content previews in chat and Files
 
