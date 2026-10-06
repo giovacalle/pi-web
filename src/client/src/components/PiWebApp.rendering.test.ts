@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { initialAppState, type AppState } from "../appState";
 import type { SessionInfo, SessionStatus, SessionWarning, Workspace } from "../api";
 import { SessionController } from "../controllers/sessionController";
+import { reportBrowserError, sessionBrowserErrorScope, workspaceBrowserErrorScope, type BrowserErrorRecovery } from "../browserErrors";
 import { machineSessionKey } from "../machineKeys";
 import { saveDraft } from "../promptDraftStorage";
 import { clearStagedAttachments, saveStagedAttachments } from "../promptAttachmentStaging";
@@ -646,6 +647,47 @@ describe("application rendering boundaries", () => {
     const unhandled = new CustomEvent("workspace-file-open", { detail, bubbles: true, composed: true, cancelable: true });
     formatted.dispatchEvent(unhandled);
     expect(unhandled.defaultPrevented).toBe(false);
+  });
+
+  it.each(["session-refresh", "workspace-sessions-refresh"] as const)("offers Retry for a persistent %s failure without a reconnect banner", async (recovery: BrowserErrorRecovery) => {
+    window.history.replaceState(null, "", `?${new URLSearchParams({ project: workspace.projectId, workspace: workspace.id, session: session.id })}`);
+    const scope = recovery === "session-refresh"
+      ? sessionBrowserErrorScope("local", session.id, { cwd: session.cwd, projectId: workspace.projectId, workspaceId: workspace.id })
+      : workspaceBrowserErrorScope("local", workspace.projectId, workspace.id);
+    const app = await mountApp({
+      selectedProject: { id: workspace.projectId, name: "Project", path: workspace.path, createdAt: "now" },
+      selectedWorkspace: workspace, selectedSession: session, mainView: "chat",
+      browserErrors: reportBrowserError({}, scope, "Updates could not be refreshed. Check your connection and retry.", recovery),
+    });
+    const sessions: unknown = Reflect.get(app, "sessions");
+    if (!(sessions instanceof SessionController)) throw new Error("Expected SessionController");
+    const refreshSelected = vi.spyOn(sessions, "refreshSelectedSession").mockResolvedValue();
+    const refreshWorkspace = vi.spyOn(sessions, "refreshCurrentWorkspaceSessions").mockResolvedValue();
+    await settle(app);
+    const retry = [...app.shadowRoot?.querySelectorAll<HTMLButtonElement>("main .error button") ?? []].find((button) => button.textContent.trim() === "Retry");
+    if (retry === undefined) throw new Error("Expected a recovery Retry button");
+    retry.click();
+
+    if (recovery === "session-refresh") {
+      expect(refreshSelected).toHaveBeenCalledExactlyOnceWith(session.id, { recoverNetwork: true });
+      expect(refreshWorkspace).not.toHaveBeenCalled();
+    } else {
+      expect(refreshWorkspace).toHaveBeenCalledExactlyOnceWith("local", { recoverNetwork: true });
+      expect(refreshSelected).not.toHaveBeenCalled();
+    }
+    expect(app.shadowRoot?.textContent).not.toContain("Reconnecting");
+  });
+
+  it("does not offer automatic recovery for a failed user action", async () => {
+    window.history.replaceState(null, "", `?${new URLSearchParams({ session: session.id })}`);
+    const app = await mountApp({
+      selectedWorkspace: workspace, selectedSession: session, mainView: "chat",
+      browserErrors: reportBrowserError({}, sessionBrowserErrorScope("local", session.id), "Prompt delivery could not be confirmed"),
+    });
+    await settle(app);
+    expect(app.shadowRoot?.textContent).toContain("Prompt delivery could not be confirmed");
+    const retry = [...app.shadowRoot?.querySelectorAll<HTMLButtonElement>("main .error button") ?? []].find((button) => button.textContent.trim() === "Retry");
+    expect(retry).toBeUndefined();
   });
 
   it("updates the workspace empty state as project loading completes", async () => {
