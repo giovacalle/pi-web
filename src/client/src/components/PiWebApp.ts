@@ -348,11 +348,6 @@ export class PiWebApp extends LitElement {
       await this.restoreRoute(false);
     });
   };
-  private readonly onPageShow = () => {
-    void this.sessionUnread.refreshAll();
-    this.appShell.repairViewportPosition();
-    this.retryPendingRemoteRouteRestoreSoon();
-  };
   private readonly onSystemLightThemeChange = () => {
     if (this.themePreference.auto) this.applyPreferredTheme(false);
   };
@@ -508,7 +503,6 @@ export class PiWebApp extends LitElement {
     super.connectedCallback();
     this.unreadConnected = true;
     window.addEventListener("popstate", this.onPopState);
-    window.addEventListener("pageshow", this.onPageShow);
     this.browserResume.connect();
     window.addEventListener("keydown", this.onKeyDown, GLOBAL_SHORTCUT_LISTENER_OPTIONS);
     window.addEventListener("focusin", this.resetKeyboardSequence);
@@ -530,7 +524,6 @@ export class PiWebApp extends LitElement {
     this.readyChatIdentity = undefined;
     this.sessionUnread.retainMachines(new Set<string>());
     window.removeEventListener("popstate", this.onPopState);
-    window.removeEventListener("pageshow", this.onPageShow);
     this.browserResume.disconnect();
     window.removeEventListener("keydown", this.onKeyDown, GLOBAL_SHORTCUT_LISTENER_OPTIONS);
     window.removeEventListener("focusin", this.resetKeyboardSequence);
@@ -621,10 +614,10 @@ export class PiWebApp extends LitElement {
   }
 
   private async refreshAfterBrowserResume(): Promise<void> {
-    await this.sessionUnread.refreshAll();
     await Promise.all([
-      this.sessions.refreshSelectedSession(),
-      this.sessions.refreshCurrentWorkspaceSessions(),
+      this.sessionUnread.refreshAll(),
+      this.sessions.refreshSelectedSession(undefined, { recoverNetwork: true }),
+      this.sessions.refreshCurrentWorkspaceSessions(selectedMachineId(this.state), { recoverNetwork: true }),
       this.refreshMachineStatusSnapshots(),
       this.refreshWorkspaceDeletionRuns(),
       this.refreshCurrentWorkspaceSurface(),
@@ -1596,7 +1589,7 @@ export class PiWebApp extends LitElement {
       (event) => { this.handleRealtimeEvent(machineId, event); },
       () => {
         // Live broadcasts are not replayed after a connection gap.
-        void this.sessions.refreshCurrentWorkspaceSessions(machineId);
+        void this.sessions.refreshCurrentWorkspaceSessions(machineId, { recoverNetwork: true });
         void this.sessionUnread.refresh(machineId);
         void this.serverNotices.refresh(machineId);
       },
@@ -3643,7 +3636,25 @@ export class PiWebApp extends LitElement {
   private renderBrowserErrorBanners(state: AppState): TemplateResult | null {
     const errors = this.visibleBrowserErrorsForCurrentRoute(state);
     if (errors.length === 0) return null;
-    return html`${errors.map((error) => errorBanner(error.message, () => { this.dismissBrowserError(error); }))}`;
+    return html`${errors.map((error) => errorBanner(
+      error.message,
+      () => { this.dismissBrowserError(error); },
+      "error",
+      error.recovery === undefined ? undefined : () => { this.retryBrowserError(error); },
+    ))}`;
+  }
+
+  private retryBrowserError(error: BrowserError): void {
+    if (this.state.browserErrors[browserErrorScopeKey(error.scope)] !== error) return;
+    const scope = error.scope;
+    if (scope.kind === "session" && error.recovery === "session-refresh" && scope.machineId === selectedMachineId(this.state)) {
+      void this.sessions.refreshSelectedSession(scope.sessionId, { recoverNetwork: true });
+    } else if (scope.kind === "workspace" && error.recovery === "workspace-sessions-refresh"
+      && scope.machineId === selectedMachineId(this.state)
+      && scope.workspaceId === this.state.selectedWorkspace?.id
+      && scope.projectId === this.state.selectedWorkspace.projectId) {
+      void this.sessions.refreshCurrentWorkspaceSessions(scope.machineId, { recoverNetwork: true });
+    }
   }
 
   private visibleBrowserErrorsForCurrentRoute(state: AppState): BrowserError[] {
