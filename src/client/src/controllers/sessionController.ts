@@ -1890,7 +1890,11 @@ export class SessionController {
       forgetCachedNewSession(session.id, machineId);
       const cachedReplacement = markCachedNewSessionInfo(replacement, machineId);
       const wasSelected = this.getState().selectedSession?.id === session.id;
-      this.setState({ sessions: [cachedReplacement, ...this.getState().sessions.filter((candidate) => candidate.id !== session.id)], error: "" });
+      // A session.created broadcast can insert the replacement before HTTP resolves.
+      this.setState({
+        sessions: [cachedReplacement, ...this.getState().sessions.filter((candidate) => candidate.id !== session.id && candidate.id !== replacement.id)],
+        error: "",
+      });
       if (wasSelected && this.navigateToSession !== undefined) {
         // Surface-only navigation retains this selection load. Carry its latest
         // surface, but keep the initiating hierarchy/session expectation so the
