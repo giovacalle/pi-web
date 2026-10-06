@@ -365,7 +365,7 @@ describe("session API compatibility", () => {
     expect(JSON.parse(requestBody(cancelInit))).toEqual({ cwd: "/repo with spaces", dialogId: "dialog 1" });
   });
 
-  it("posts session tree navigation through an encoded cwd-scoped machine route", async () => {
+  it("posts exact-entry session tree navigation without retainCheckpoint through an encoded machine route", async () => {
     const fetchMock = stubJsonFetch({ cancelled: false, editorText: "edit this" });
     const navigation = { targetId: "entry /?", expectedLeafId: "leaf-1", summary: { mode: "custom" as const, instructions: "focus on tests" } };
 
@@ -376,6 +376,24 @@ describe("session API compatibility", () => {
     expect(url).toBe("https://pi.example.test/api/machines/remote%20%2F%3F/sessions/s%20%2F%3F/tree/navigate");
     expect(init?.method).toBe("POST");
     expect(JSON.parse(requestBody(init))).toEqual({ cwd: "/repo with spaces", ...navigation });
+  });
+
+  it.each([true, false])("serializes retainCheckpoint=%s for session tree navigation", async (retainCheckpoint) => {
+    const fetchMock = stubJsonFetch({ cancelled: false });
+
+    await sessionsApi.navigateTree(
+      { id: "s-1", cwd: "/repo" },
+      { targetId: "entry-1", expectedLeafId: "leaf-1", summary: { mode: "none" }, retainCheckpoint },
+    );
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(JSON.parse(requestBody(fetchCall(fetchMock, 0)[1]))).toEqual({
+      cwd: "/repo",
+      targetId: "entry-1",
+      expectedLeafId: "leaf-1",
+      summary: { mode: "none" },
+      retainCheckpoint,
+    });
   });
 
   it("keeps session tree navigation under a canonical nested deployment base", async () => {
@@ -393,7 +411,7 @@ describe("session API compatibility", () => {
     expect(fetchCall(fetchMock, 0)[0]).toBe("https://pi.example.test/nested/pi-web/api/machines/remote%20%2F%3F/sessions/session%20%2F%3F/tree/navigate");
   });
 
-  it("posts session tree forks through an encoded cwd-scoped machine route", async () => {
+  it("posts exact-entry session tree forks without retainCheckpoint through an encoded machine route", async () => {
     const fetchMock = stubJsonFetch({ cancelled: true });
     const fork = { entryId: "entry /?", expectedLeafId: "leaf-1" };
 
@@ -404,6 +422,23 @@ describe("session API compatibility", () => {
     expect(url).toBe("https://pi.example.test/api/machines/remote%20%2F%3F/sessions/s%20%2F%3F/tree/fork");
     expect(init?.method).toBe("POST");
     expect(JSON.parse(requestBody(init))).toEqual({ cwd: "/repo with spaces", ...fork });
+  });
+
+  it.each([true, false])("serializes retainCheckpoint=%s for session tree forks", async (retainCheckpoint) => {
+    const fetchMock = stubJsonFetch({ cancelled: true });
+
+    await sessionsApi.forkTree(
+      { id: "s-1", cwd: "/repo" },
+      { entryId: "entry-1", expectedLeafId: "leaf-1", retainCheckpoint },
+    );
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(JSON.parse(requestBody(fetchCall(fetchMock, 0)[1]))).toEqual({
+      cwd: "/repo",
+      entryId: "entry-1",
+      expectedLeafId: "leaf-1",
+      retainCheckpoint,
+    });
   });
 
   it("recognizes an old daemon only from the missing tree/fork route response", async () => {

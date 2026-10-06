@@ -39,6 +39,8 @@ import { corePlugin } from "../plugins/core";
 import { themePackPlugin } from "../plugins/themes";
 import { loadExternalPlugins, type ExternalPluginLoadResult } from "../plugins/external";
 import { publicPluginSelection } from "../plugins/publicContext";
+import type { DisplayedMessageActionAvailabilityContext, MessageActionAvailabilityContext, MessageActionContext, MessageActionResult } from "../../../plugin-api";
+import { messageActionMessage } from "../plugins/messageActions";
 import { createPluginProjects } from "../plugins/projects";
 import { REQUIRED_TERMINAL_PLUGIN_ID, type TerminalPluginMode } from "../../../shared/requiredTerminalPlugin";
 import { PluginRegistry, installApplicationPanelScope, installPluginRuntimeScope, installWorkspaceLabelScope, installWorkspacePanelScope, type BrowserPluginLifecyclePhase, type PluginRegistrationFailure } from "../plugins/registry";
@@ -3420,7 +3422,88 @@ export class PiWebApp extends LitElement {
   };
 
   private readonly emptyClientQueue: NonNullable<AppState["clientQueuedSessionMessages"][string]> = [];
-  private readonly handleMessageAction = (entryId: string, action: "fork" | "back") => this.sessions.actOnMessage(entryId, action);
+  private messageActionInputs = "";
+  private messageActionSnapshot: Omit<MessageActionAvailabilityContext, "message"> | undefined;
+
+  private messageActionContext(state: AppState): Omit<MessageActionAvailabilityContext, "message"> | undefined {
+    const session = publicPluginSelection(state).selectedSession;
+    if (session === undefined) return undefined;
+    const context = {
+      machine: Object.freeze(pluginMachineFromState(state)),
+      session: Object.freeze({ ...session, busy: state.sendingPrompts[session.id] === true || isSessionActive(state.status, state.activity) }),
+    };
+    const inputs = JSON.stringify(context);
+    if (inputs !== this.messageActionInputs) {
+      this.messageActionInputs = inputs;
+      this.messageActionSnapshot = context;
+    }
+    return this.messageActionSnapshot;
+  }
+
+  private readonly handleMessageAction = async (target: MessageActionAvailabilityContext, actionId: string): Promise<MessageActionResult> => {
+    const state = this.state;
+    const context = this.messageActionContext(state);
+    if (context?.machine.id !== target.machine.id || context.session.id !== target.session.id) return;
+    const message = state.messages.find((item) => item.entryId === target.message.entryId);
+    const snapshot = message === undefined ? undefined : messageActionMessage(message, target.message.role);
+    if (snapshot === undefined) return;
+    const input = { ...context, message: snapshot };
+    return this.plugins.runMessageAction(actionId, input, (binding): MessageActionContext => {
+      const isCurrent = () => selectedMachineId(this.state) === input.machine.id && this.state.selectedSession?.id === input.session.id;
+      const actOnHistory = async (action: "fork" | "back"): Promise<void> => {
+        if (!isCurrent() || !this.plugins.promptChipOwnerAvailable(binding.registrationPluginId, input.machine.id)) {
+          throw new Error("This message's conversation is no longer available.");
+        }
+        return this.sessions.actOnMessage(input.message.entryId, action);
+      };
+      return {
+        ...input,
+        ...this.messageActionHelpers(binding, input),
+        history: { fork: () => actOnHistory("fork"), goBack: () => actOnHistory("back") },
+      };
+    });
+  };
+
+  private readonly handleDisplayedMessageAction = async (target: DisplayedMessageActionAvailabilityContext, actionId: string): Promise<MessageActionResult> => {
+    const context = this.messageActionContext(this.state);
+    if (context?.machine.id !== target.machine.id || context.session.id !== target.session.id) return;
+    // Display workflows operate on the clicked slice, even before it has an
+    // entry ID or when several normalized lines share the same durable ID.
+    const input = { ...context, message: target.message };
+    return this.plugins.runDisplayedMessageAction(actionId, input, (binding) => ({
+      ...input,
+      ...this.messageActionHelpers(binding, input),
+    }));
+  };
+
+  private messageActionHelpers(
+    binding: WorkspacePluginBinding,
+    input: Omit<MessageActionAvailabilityContext, "message">,
+  ): Omit<MessageActionContext, "machine" | "session" | "message" | "history"> {
+    const state = this.state;
+    const machineId = input.machine.id;
+    const workspace = state.selectedWorkspace;
+    const workspaceSnapshot = publicPluginSelection(state).selectedWorkspace;
+    const peer = workspace === undefined ? undefined : createPluginPeer(binding, workspace, machineId);
+    const isCurrent = () => selectedMachineId(this.state) === machineId && this.state.selectedSession?.id === input.session.id;
+    const prompt = this.createPromptEditor(binding.registrationPluginId, machineId);
+    return {
+      prompt: {
+        ...prompt,
+        insertText: (text) => { if (isCurrent()) prompt.insertText(text); },
+        getText: () => isCurrent() ? prompt.getText() : "",
+        getSelection: () => isCurrent() ? prompt.getSelection() : null,
+      },
+      navigate: (destination) => this.navigate({ ...destination, machineId: destination.machineId ?? machineId }),
+      projects: createPluginProjects(projectsApi, machineId),
+      ...(workspace === undefined || workspaceSnapshot === undefined ? {} : {
+        workspace: workspaceSnapshot,
+        files: this.createWorkspaceFiles(workspace, input.machine),
+        ...(this.terminalAvailableForMachine(machineId) ? { terminal: this.workspaceTerminal(binding.registrationPluginId, workspace, machineId) } : {}),
+      }),
+      ...(peer === undefined ? {} : { peer }),
+    };
+  }
   private readonly handleUseSuggestedInput = (machineId: string, sessionId: string): void => {
     void this.sessions.useSuggestedInput(machineId, sessionId);
   };
@@ -3434,7 +3517,7 @@ export class PiWebApp extends LitElement {
       this.notificationView = selectedNotificationView(state.selectedNotificationInbox);
     }
     return html`
-      <chat-view .contentRendering=${this.plugins.chatContentRendering} .machineId=${selectedMachineId(state)} @workspace-file-open=${this.handleWorkspaceFileOpen} .workspaceContext=${markdownWorkspaceContext(selectedMachineId(state), state.selectedWorkspace, session)} .sessionId=${session.id} .sessionCwd=${session.cwd} .onMessageAction=${this.handleMessageAction} .messageActionsDisabled=${session.archived === true || state.sendingPrompts[session.id] === true || isSessionActive(state.status, state.activity)} .messages=${state.messages} .messageStart=${state.messagePageStart} .messageEnd=${state.messagePageEnd} .messageTotal=${state.messagePageTotal} .hasMore=${state.messagePageStart > 0} .loadingMore=${state.isLoadingEarlierMessages} .isSendingPrompt=${state.sendingPrompts[session.id] === true} .isCompacting=${state.status?.isCompacting === true} .pendingMessageCount=${state.status?.pendingMessageCount ?? 0} .clientQueuedMessages=${state.clientQueuedSessionMessages[session.id] ?? this.emptyClientQueue} .status=${state.status} .onUseSuggestedInput=${session.archived === true ? undefined : this.handleUseSuggestedInput} .activity=${state.activity} .pendingAsk=${state.pendingAsk} .pendingDialogs=${state.pendingDialogs} .closedDialogs=${state.closedDialogs} .onAnswerDialog=${this.handleAnswerDialog} .onCancelDialog=${this.handleCancelDialog} .onDismissClosedDialog=${this.handleDismissClosedDialog} .askDraftSessionId=${machineSessionKey(selectedMachineId(state), session.id)} .onSubmitAsk=${this.handleSubmitAsk} .notificationInbox=${this.notificationView} .onClearServerQueue=${this.handleClearServerQueue} .onDismissWarning=${this.handleDismissWarning} .onDismissNotification=${this.handleDismissNotification} .onDismissAllNotifications=${this.handleDismissAllNotifications} .warningsVisible=${!this.sessionWarningVisibility.collapsed} .onToggleWarnings=${this.handleToggleWarnings} .onLoadMore=${this.handleLoadEarlierMessages}></chat-view>
+      <chat-view .contentRendering=${this.plugins.chatContentRendering} .machineId=${selectedMachineId(state)} @workspace-file-open=${this.handleWorkspaceFileOpen} .workspaceContext=${markdownWorkspaceContext(selectedMachineId(state), state.selectedWorkspace, session)} .sessionId=${session.id} .sessionCwd=${session.cwd} .onMessageAction=${this.handleMessageAction} .onDisplayedMessageAction=${this.handleDisplayedMessageAction} .messageActions=${this.plugins.getMessageActions(selectedMachineId(state))} .messageActionContext=${this.messageActionContext(state)} .messages=${state.messages} .messageStart=${state.messagePageStart} .messageEnd=${state.messagePageEnd} .messageTotal=${state.messagePageTotal} .hasMore=${state.messagePageStart > 0} .loadingMore=${state.isLoadingEarlierMessages} .isSendingPrompt=${state.sendingPrompts[session.id] === true} .isCompacting=${state.status?.isCompacting === true} .pendingMessageCount=${state.status?.pendingMessageCount ?? 0} .clientQueuedMessages=${state.clientQueuedSessionMessages[session.id] ?? this.emptyClientQueue} .status=${state.status} .onUseSuggestedInput=${session.archived === true ? undefined : this.handleUseSuggestedInput} .activity=${state.activity} .pendingAsk=${state.pendingAsk} .pendingDialogs=${state.pendingDialogs} .closedDialogs=${state.closedDialogs} .onAnswerDialog=${this.handleAnswerDialog} .onCancelDialog=${this.handleCancelDialog} .onDismissClosedDialog=${this.handleDismissClosedDialog} .askDraftSessionId=${machineSessionKey(selectedMachineId(state), session.id)} .onSubmitAsk=${this.handleSubmitAsk} .notificationInbox=${this.notificationView} .onClearServerQueue=${this.handleClearServerQueue} .onDismissWarning=${this.handleDismissWarning} .onDismissNotification=${this.handleDismissNotification} .onDismissAllNotifications=${this.handleDismissAllNotifications} .warningsVisible=${!this.sessionWarningVisibility.collapsed} .onToggleWarnings=${this.handleToggleWarnings} .onLoadMore=${this.handleLoadEarlierMessages}></chat-view>
     `;
   }
 

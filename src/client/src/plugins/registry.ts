@@ -1,5 +1,6 @@
 import { html, svg } from "lit";
-import type { ContentRenderRequest, PluginSelectionSnapshot } from "../../../plugin-api";
+import type { ContentRenderRequest, DisplayedMessageActionAvailabilityContext, DisplayedMessageActionContext, MessageActionAvailabilityContext, MessageActionContext, MessageActionResult, PluginSelectionSnapshot } from "../../../plugin-api";
+import { availableDisplayedMessageActions, availableMessageActions, type RegisteredMessageAction } from "./messageActions";
 import { PluginSelectionHost } from "./selection";
 import { PromptChipStore, type PromptChipTarget } from "../promptChips";
 import type { PluginPromptEditor } from "../../../plugin-api";
@@ -82,6 +83,7 @@ interface PreparedPluginContributions {
   readonly contentRenderers: readonly RegisteredContentRenderer[];
   readonly ids: ReadonlySet<QualifiedContributionId>;
   readonly actions: readonly RegisteredPluginAction[];
+  readonly messageActions: readonly RegisteredMessageAction[];
   readonly workspacePanels: readonly QualifiedWorkspacePanelContribution[];
   readonly applicationPanels: readonly QualifiedApplicationPanelContribution[];
   readonly workspaceLabels: readonly QualifiedWorkspaceLabelContribution[];
@@ -150,6 +152,39 @@ export class PluginRegistry {
       .sort(compareContentRenderers)
       .map((renderer) => ({ id: renderer.id, label: renderer.label, renderer }));
   }
+  private readonly messageActions: RegisteredMessageAction[] = [];
+  private messageActionView: readonly RegisteredMessageAction[] = [];
+
+  getMessageActions(machineId: string): readonly RegisteredMessageAction[] {
+    const actions = this.messageActions.filter((action) => this.isContributionActive(action.binding.registrationPluginId, action.machineId, machineId, action.binding.sourcePluginId));
+    if (actions.length !== this.messageActionView.length || actions.some((action, index) => action !== this.messageActionView[index])) {
+      this.messageActionView = actions;
+    }
+    return this.messageActionView;
+  }
+
+  async runMessageAction(
+    id: string,
+    input: MessageActionAvailabilityContext,
+    createContext: (binding: WorkspacePluginBinding) => MessageActionContext,
+  ): Promise<MessageActionResult> {
+    const actions = this.getMessageActions(input.machine.id).filter((action) => action.id === id);
+    const available = availableMessageActions(actions, input)[0];
+    if (available?.enabled !== true || available.action.target === "display") return;
+    return available.action.run(createContext(available.action.binding));
+  }
+
+  async runDisplayedMessageAction(
+    id: string,
+    input: DisplayedMessageActionAvailabilityContext,
+    createContext: (binding: WorkspacePluginBinding) => DisplayedMessageActionContext,
+  ): Promise<MessageActionResult> {
+    const actions = this.getMessageActions(input.machine.id).filter((action) => action.id === id);
+    const available = availableDisplayedMessageActions(actions, input)[0];
+    if (available?.enabled !== true || available.action.target !== "display") return;
+    return available.action.run(createContext(available.action.binding));
+  }
+
   private readonly actions: RegisteredPluginAction[] = [];
   private readonly workspacePanels: QualifiedWorkspacePanelContribution[] = [];
   private readonly applicationPanels: QualifiedApplicationPanelContribution[] = [];
@@ -244,6 +279,7 @@ export class PluginRegistry {
     this.hostCapabilitySnapshotsByRegistration.clear();
     this.pluginIds.clear();
     this.actions.splice(0);
+    this.messageActions.splice(0);
     this.contentRenderers.splice(0);
     this.workspacePanels.splice(0);
     this.applicationPanels.splice(0);
@@ -446,6 +482,12 @@ export class PluginRegistry {
         },
       };
     });
+    const messageActions = (contributions.messageActions ?? []).map((action): RegisteredMessageAction => Object.freeze({
+      ...action,
+      id: this.qualify(runtimePluginId, action.id, contributionIds),
+      binding: workspacePluginBinding(runtimePluginId, registration.sourcePluginId, backendRevision, pairedRequestVersion, pairedChannelVersion),
+      ...(registration.machineId === undefined ? {} : { machineId: registration.machineId }),
+    }));
     const actions = (contributions.actions ?? []).map((action) => this.qualifyAction(runtimePluginId, action, registration.machineId, registration.sourcePluginId, contributionIds));
     const applicationPanels = (contributions.applicationPanels ?? []).map((panel) => this.qualifyApplicationPanel(runtimePluginId, panel, registration.machineId, registration.sourcePluginId, contributionIds));
     const workspacePanels = (contributions.workspacePanels ?? []).map((panel) => this.qualifyWorkspacePanel(runtimePluginId, panel, registration.machineId, registration.sourcePluginId, backendRevision, pairedRequestVersion, pairedChannelVersion, contributionIds));
@@ -456,7 +498,7 @@ export class PluginRegistry {
     const themePairs = registration.machineId === undefined
       ? (contributions.themePairs ?? []).map((pair) => this.qualifyThemePair(runtimePluginId, pair, contributionIds))
       : [];
-    return Object.freeze({ ids: contributionIds, contentRenderers, actions, applicationPanels, workspacePanels, workspaceLabels, themes, themePairs });
+    return Object.freeze({ ids: contributionIds, contentRenderers, actions, messageActions, applicationPanels, workspacePanels, workspaceLabels, themes, themePairs });
   }
 
   private dependencyFailure(
@@ -562,6 +604,7 @@ export class PluginRegistry {
     for (const contributionId of staged.contributions.ids) this.contributionIds.add(contributionId);
     this.contentRenderers.push(...staged.contributions.contentRenderers);
     this.actions.push(...staged.contributions.actions);
+    this.messageActions.push(...staged.contributions.messageActions);
     this.workspacePanels.push(...staged.contributions.workspacePanels);
     this.applicationPanels.push(...staged.contributions.applicationPanels);
     this.workspaceLabels.push(...staged.contributions.workspaceLabels);
@@ -1435,7 +1478,7 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-const contributionNames: readonly string[] = ["actions", "applicationPanels", "workspacePanels", "workspaceLabels", "themes", "themePairs", "contentRenderers"];
+const contributionNames: readonly string[] = ["actions", "applicationPanels", "workspacePanels", "workspaceLabels", "themes", "themePairs", "contentRenderers", "messageActions"];
 
 function isPluginContributions(value: unknown): value is PluginContributions {
   if (!isRecord(value)) return false;
