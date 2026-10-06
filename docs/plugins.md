@@ -11,6 +11,7 @@ This guide explains what is possible and what to expect. For implementation, use
 | Show project health, service links, or environment information | Workspace labels and panels |
 | Add a dashboard, file viewer, or project-specific tool | Workspace panels, file helpers, and browser UI |
 | Make common actions easier to find | Action-palette commands and shortcuts |
+| Act on a chat message | Message-action callbacks |
 | Run builds, tests, or development servers | Workspace terminal commands |
 | Customize the appearance | Themes and light/dark theme pairs |
 | Preview diagrams or other text formats in chat and Files | Browser content renderers |
@@ -40,7 +41,7 @@ Use a Pi extension for agent behavior and a PI WEB plugin for web UI. When a fea
 
 A plugin package declares a browser entry, a server entry, or both:
 
-- **Browser entries** add actions, panels, labels, themes, and content renderers. They use host helpers for workspace files, terminals, and prompt editing.
+- **Browser entries** add palette and message actions, panels, labels, themes, and content renderers. They use host helpers for workspace files, terminals, and prompt editing.
 - **Server entries** run in the session daemon. They can serve their browser entry, store plugin data, use host capabilities, or provide workspaces.
 - **Package peers** connect a plugin's browser and server entries. The host handles the selected machine and workspace; a plugin does not need to own that workspace to serve it.
 - **Capabilities** let a plugin declare the host or plugin functionality it requires. Dependencies must be available at the requested version before the plugin starts.
@@ -159,6 +160,32 @@ await context.navigate({
 All destination fields are optional: `machineId`, `projectId`, `workspaceId`, `sessionId`, `view` (`navigation`, `chat`, or `workspace`), and `tool` (a qualified contribution ID). Omitted `machineId` means the machine selected when called. This is not a route patch: omitted fields use normal host restoration defaults rather than copying the current route's session, tool, or contribution query. Those defaults can select a remembered session. Supply the project/workspace scope when opening a known session; the host does not search for IDs or create missing destinations.
 
 The promise settles after host restoration, or normally when newer navigation supersedes it. Missing or unavailable destinations use the normal host UI and do not also reject the promise. Malformed argument types and invalid `view` values reject with `TypeError` before changing the URL or UI. Captain's Log uses this API for **Open source session** on translations that record a source session.
+
+### Message actions
+
+Contribute `messageActions` to put a plugin-defined button beside an identified transcript message. Each action has a plugin-local `id`, a `title` used as its accessible label, an optional Lit `icon`, and a `run(context)` callback. The callback performs your own workflow; it is not a choice from a host operation catalog. PI WEB adds no confirmation. Fork and Go back are core plugin contributions using this same flow, with their existing confirmations. Copy remains independent.
+
+```ts
+return {
+  contributions: {
+    messageActions: [{
+      id: "quote",
+      title: "Quote in next prompt",
+      visible: ({ message }) => message.role === "user",
+      enabled: ({ session }) => !session.archived && !session.pending,
+      run: ({ message, prompt }) => {
+        prompt.setChip?.({ id: "quote", label: "Quoted message", text: message.text });
+      },
+    }],
+  },
+};
+```
+
+`visible` and `enabled` are optional synchronous, side-effect-free checks (both default to true). Their small context contains `machine`, `session` (basic identity plus `archived`, `pending`, and `busy`), and `message` (`entryId`, `role`, and `text`). Role follows the displayed header (including grouped skill reads). Text is the entry's ordinary text parts joined with blank lines, not thinking, image data, or tool payloads. Buttons appear on rendered message headers only for durable entries; optimistic/in-flight messages have no contributed actions. Availability is cached for unchanged historical messages. It is refreshed when the message, these machine/session inputs, or active contributions change, and rechecked at invocation. Do not depend on unrelated mutable plugin state or perform requests in availability callbacks. Streaming an unrelated message does not repeat historical checks, and rendering makes no request per message.
+
+`run` receives a fresh message/session snapshot plus `prompt`, `navigate`, and machine-bound `projects`. With a selected workspace it also receives `workspace`, `files`, an optional `terminal`, and any exact package-paired `peer` capabilities. Helpers use the initiating machine/workspace. Navigation defaults to that machine unless explicitly overridden. Prompt chips target the initiating conversation; cursor insertion and reads apply only while it remains selected. `history.fork()` and `history.goBack()` are workflow helpers on the clicked message: they load fresh history and retain guarded tree mutations and initiating-client result/draft behavior. They reject if that conversation is no longer selected or the plugin is unavailable. They do not undo filesystem changes. An action's rejected promise appears beside the message; pending actions temporarily disable contributed buttons, not Copy.
+
+Browser API v4 remains compatible; older hosts may ignore `messageActions`. Update PI WEB to use this contribution point. It does not expose a whole-transcript subscription.
 
 ### Content previews in chat and Files
 

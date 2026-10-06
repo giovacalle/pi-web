@@ -158,6 +158,7 @@ export interface ContentRenderingCapability {
 
 export interface PluginContributions {
   contentRenderers?: ContentRendererContribution[];
+  messageActions?: MessageActionContribution[];
   actions?: PluginAction[];
   applicationPanels?: ApplicationPanelContribution[];
   workspacePanels?: WorkspacePanelContribution[];
@@ -304,6 +305,47 @@ export interface PluginRuntimeContext {
   startSession: () => void | Promise<void>;
   archiveSession: () => void | Promise<void>;
   stopActiveWork: () => void | Promise<void>;
+}
+
+/** A durable message displayed in the transcript; text excludes thinking and tool payloads. */
+export interface MessageActionMessage {
+  readonly entryId: string;
+  readonly role: "user" | "assistant" | "tool" | "system" | "bash" | "skill";
+  readonly text: string;
+}
+
+/** Small, detached inputs for synchronous, side-effect-free availability checks. */
+export interface MessageActionAvailabilityContext {
+  readonly machine: Readonly<PluginMachine>;
+  readonly session: Readonly<PluginSelectedSession & { busy: boolean }>;
+  readonly message: MessageActionMessage;
+}
+
+/** Created on invocation, with helpers scoped to the initiating machine/conversation. */
+export interface MessageActionContext extends MessageActionAvailabilityContext {
+  readonly prompt: PluginPromptEditor;
+  readonly navigate: (destination: PluginNavigationDestination) => Promise<void>;
+  readonly projects: PluginProjects;
+  readonly workspace?: Workspace;
+  readonly files?: WorkspaceFilesContextValue;
+  readonly peer?: PluginPeer;
+  readonly terminal?: WorkspacePanelTerminal;
+  /** Guarded, fresh-history operations on this message; confirmation is the plugin's choice. */
+  readonly history: {
+    readonly fork: () => Promise<void>;
+    readonly goBack: () => Promise<void>;
+  };
+}
+
+export interface MessageActionContribution {
+  id: LocalContributionId;
+  title: string;
+  icon?: TemplateResult;
+  /** Checks run only when their message/session inputs or active contributions change. No I/O. */
+  visible?: (context: MessageActionAvailabilityContext) => boolean;
+  enabled?: (context: MessageActionAvailabilityContext) => boolean;
+  /** Plugin-defined workflow; the host does not add a confirmation. */
+  run: (context: MessageActionContext) => void | Promise<void>;
 }
 
 export interface PluginAction {

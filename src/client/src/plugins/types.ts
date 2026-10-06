@@ -79,6 +79,7 @@ export interface PluginActivationResult {
 
 export interface PluginContributions {
   contentRenderers?: import("../../../plugin-api").ContentRendererContribution[];
+  messageActions?: import("../../../plugin-api").MessageActionContribution[];
   actions?: PluginAction[];
   applicationPanels?: ApplicationPanelContribution[];
   workspacePanels?: WorkspacePanelContribution[];
