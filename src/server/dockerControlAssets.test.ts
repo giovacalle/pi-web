@@ -46,6 +46,14 @@ describe("Docker command assets", () => {
     ]);
   });
 
+  it.each(["docker/Dockerfile", "docker/Dockerfile.dev"])("defaults %s to an overridable UTF-8 locale", async (path) => {
+    const dockerfile = await readRepoFile(path);
+
+    expect(dockerfile).toContain("  LANG=C.UTF-8 \\\n");
+    // LANG provides a default without overriding user-selected locale categories.
+    expect(dockerfile).not.toMatch(/\bLC_ALL=/u);
+  });
+
   it("packages the canonical Docker command and internal support assets", async () => {
     const [dockerfile, devDockerfile, runtimeCompose, devCompose, installer, devWrapper, dependencySync, dockerignore] = await Promise.all([
       readRepoFile("docker/Dockerfile"),

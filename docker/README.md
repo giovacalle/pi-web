@@ -240,6 +240,8 @@ PI_WEB_MACHINES_FILE=/data/pi-web/machines-dev.json
 
 Omitted keys inherit the shared file (or the application's default when neither file sets them). Explicit Compose `environment:` values still win over either env file. These files use Docker Compose dotenv syntax, not shell scripts.
 
+Both images default to `LANG=C.UTF-8`, giving terminals and agent tools a UTF-8 locale. Set `LANG` or individual `LC_*` values in either container environment file to use another installed locale.
+
 Apply changes by recreating the affected containers. Recreating `sessiond` interrupts active sessions; schedule this when those sessions can be stopped:
 
 ```bash
