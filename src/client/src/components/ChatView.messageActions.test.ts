@@ -1,10 +1,12 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { DisplayedMessageActionAvailabilityContext, DisplayedMessageActionContext, EntryMessageActionContribution, MessageActionAvailabilityContext, MessageActionContext, MessageActionContribution, MessageActionFeedback } from "../../../plugin-api";
+import type { DisplayedMessageActionAvailabilityContext, DisplayedMessageActionContext, DisplayedMessageActionContribution, EntryMessageActionContribution, MessageActionAvailabilityContext, MessageActionContext, MessageActionContribution, MessageActionFeedback } from "../../../plugin-api";
 import * as clipboard from "../clipboard";
+import { normalizeMessages } from "../chatMessages";
 import { corePlugin } from "../plugins/core";
 import { PluginRegistry } from "../plugins/registry";
 import type { ChatLine } from "./shared";
+import type { FormattedText } from "./FormattedText";
 import { ChatView } from "./ChatView";
 
 const base = {
@@ -126,6 +128,62 @@ describe("plugin-defined transcript message actions", () => {
     button(view, "Inspect skill").click();
     await settle(view);
     expect(view.onMessageAction).toHaveBeenCalledWith({ ...base, message: { entryId: "skill-entry", role: "skill", text: "" } }, "custom:skill");
+  });
+
+  it("renders whole-entry history only on the reply while display plugins remain on shared thinking/reply headers", async () => {
+    const displayRun = vi.fn<DisplayedMessageActionContribution["run"]>();
+    const { view } = await mount([{ target: "display", id: "inspect", title: "Inspect slice", run: displayRun }]);
+    const onHistory = vi.fn(() => Promise.resolve());
+    view.onMessageAction = onHistory;
+    view.messageStart = 20;
+    view.messages = normalizeMessages([{ role: "assistant", entryId: "assistant-8", content: [
+      { type: "thinking", thinking: "Considering user testing messages" },
+      { type: "text", text: "Test message 8/10" },
+    ] }]);
+    await settle(view);
+    const group = view.renderRoot.querySelector<HTMLDetailsElement>("details.event-group");
+    if (group === null) throw new Error("Missing thinking event group");
+    expect(group.open).toBe(false);
+    group.open = true;
+    group.dispatchEvent(new Event("toggle"));
+    await settle(view);
+
+    const thinking = group.querySelector<HTMLElement>("section.group-msg.assistant");
+    const reply = view.renderRoot.querySelector<HTMLElement>("article.msg.assistant");
+    if (thinking === null || reply === null) throw new Error("Missing shared-entry slices");
+    const formatted = [thinking, reply].map((slice) => {
+      const element = slice.querySelector<FormattedText>("formatted-text");
+      if (element === null) throw new Error("Missing slice text");
+      return element;
+    });
+    await Promise.all(formatted.map((element) => element.updateComplete));
+    expect(formatted.map((element) => element.renderRoot.textContent)).toEqual([
+      expect.stringContaining("Considering user testing messages"), expect.stringContaining("Test message 8/10"),
+    ]);
+    expect(Array.from(thinking.querySelectorAll<HTMLButtonElement>(".msg-action"), (action) => action.title)).toEqual(["Inspect slice"]);
+    expect(Array.from(reply.querySelectorAll<HTMLButtonElement>(".msg-action"), (action) => action.title)).toEqual([
+      "Clone session from this message", "Go back to this message", "Copy message", "Inspect slice",
+    ]);
+    for (const label of ["Clone session from this message", "Go back to this message"]) {
+      expect(buttons(view).filter((action) => action.getAttribute("aria-label") === label)).toHaveLength(1);
+    }
+
+    const displayButtons = buttons(view).filter((action) => action.title === "Inspect slice");
+    for (const action of displayButtons) {
+      action.click();
+      await settle(view);
+    }
+    expect(displayRun.mock.calls.map(([context]) => context.message)).toEqual([
+      { entryId: "assistant-8", role: "assistant", text: "" },
+      { entryId: "assistant-8", role: "assistant", text: "Test message 8/10" },
+    ]);
+    const fork = view.messageActions.find((action) => action.title === "Clone session from this message");
+    if (fork === undefined) throw new Error("Missing history contribution");
+    button(view, fork.title).click();
+    await settle(view);
+    expect(onHistory).toHaveBeenCalledExactlyOnceWith({
+      ...base, message: { entryId: "assistant-8", role: "assistant", text: "Test message 8/10" },
+    }, fork.id);
   });
 
   it("offers only opted-in display actions without a durable entry", async () => {

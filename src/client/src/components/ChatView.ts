@@ -6,7 +6,7 @@ import { ChatDisclosureController } from "../chatDisclosure";
 import type { DisplayedMessageActionAvailabilityContext, MessageActionAvailabilityContext, MessageActionFeedback, MessageActionResult } from "../../../plugin-api";
 import { displayedMessageActionMessage, messageActionMessage, MessageActionAvailabilityCache, type RegisteredMessageAction } from "../plugins/messageActions";
 import { machineSessionKey } from "../machineKeys";
-import { groupChatMessages, summarizeChatGroup, type ChatGroup } from "../chatGroups";
+import { canonicalEntryActionHeaders, chatMessageHasHeader, groupChatMessages, summarizeChatGroup, type ChatGroup } from "../chatGroups";
 import { capturePrependScrollAnchor, PREPEND_RESTORE_SETTLE_FRAMES, restorePrependScrollAnchor, type PrependScrollAnchor } from "../chatScrollAnchoring";
 import { shouldRequestEarlierMessages } from "../chatHistoryLoading";
 import { ChatScrollController, distanceFromScrollBottom, findFirstVisibleArticle, isNearScrollBottom, type ChatAnchorScrollPosition, type ChatScrollRestoreResult } from "../chatScrollPosition";
@@ -458,6 +458,7 @@ export class ChatView extends LitElement {
 
   override render() {
     const groups = this.groupedMessages();
+    const entryActionHeaders = canonicalEntryActionHeaders(groups);
     // Keep incremental updates within one transcript, but dispose the whole
     // repeat part when the transcript changes. Besides preventing cross-session
     // DOM reuse, clearing the part reclaims the end markers that the current Lit
@@ -474,9 +475,9 @@ export class ChatView extends LitElement {
             groups,
             (group) => group.kind === "group" ? this.groupRenderKey(group.startIndex) : this.messageAnchorKey(group.index),
             (group, index) => {
-              if (group.kind === "group") return this.renderMessageGroup(group.messages, group.startIndex, group.endIndex, this.isLiveTailGroup(groups, index));
-              if (group.kind === "tool-image") return this.renderToolImageOutput(group.message, group.index, group.toolName);
-              return this.renderMessage(group.message, group.index);
+              if (group.kind === "group") return this.renderMessageGroup(group.messages, group.startIndex, group.endIndex, this.isLiveTailGroup(groups, index), entryActionHeaders);
+              if (group.kind === "tool-image") return this.renderToolImageOutput(group.message, group.index, entryActionHeaders, group.toolName);
+              return this.renderMessage(group.message, group.index, entryActionHeaders);
             },
           ))}
           ${this.renderQueuedMessages()}
@@ -888,25 +889,25 @@ export class ChatView extends LitElement {
     return Math.max(this.messageEnd, this.messageStart + this.messages.length);
   }
 
-  private renderMessage(message: ChatLine, index: number) {
+  private renderMessage(message: ChatLine, index: number, entryActionHeaders: ReadonlySet<ChatLine>) {
     const toolOnly = this.isToolExecutionOnlyMessage(message);
-    const askUserRecordOnly = this.isAskUserRecordOnlyMessage(message);
+    const hasHeader = chatMessageHasHeader(message);
     const shellClass = toolOnly ? "msg tool-execution-shell" : "msg ask-user-record-shell";
     return html`
       ${this.renderScrollMarker(this.messageScrollMarkerId(index))}
-      <article class=${toolOnly || askUserRecordOnly ? shellClass : `msg ${message.role}`} data-index=${index} data-scroll-anchor-id=${this.messageAnchorKey(index)}>
-        ${toolOnly || askUserRecordOnly ? null : this.renderMessageHeader(message, String(index), index)}
+      <article class=${hasHeader ? `msg ${message.role}` : shellClass} data-index=${index} data-scroll-anchor-id=${this.messageAnchorKey(index)}>
+        ${hasHeader ? this.renderMessageHeader(message, String(index), index, entryActionHeaders) : null}
         ${message.parts.map((part, partIndex) => this.renderPart(part, message, index, partIndex))}
       </article>
     `;
   }
 
-  private renderToolImageOutput(message: ChatLine, index: number, toolName?: string) {
+  private renderToolImageOutput(message: ChatLine, index: number, entryActionHeaders: ReadonlySet<ChatLine>, toolName?: string) {
     const label = chatToolOutputLabel(toolName);
     return html`
       ${this.renderScrollMarker(this.messageScrollMarkerId(index))}
       <article class="msg tool-image-output" data-index=${index} data-scroll-anchor-id=${this.messageAnchorKey(index)}>
-        ${this.renderMessageHeader(message, String(index), index, label)}
+        ${this.renderMessageHeader(message, String(index), index, entryActionHeaders, label)}
         ${message.parts.map((part, partIndex) => this.renderPart(part, message, index, partIndex))}
       </article>
     `;
@@ -916,11 +917,7 @@ export class ChatView extends LitElement {
     return message.role === "tool" && message.parts.length > 0 && message.parts.every((part) => part.type === "toolExecution");
   }
 
-  private isAskUserRecordOnlyMessage(message: ChatLine): boolean {
-    return message.parts.length > 0 && message.parts.every((part) => part.type === "askUserRecord");
-  }
-
-  private renderMessageGroup(messages: ChatLine[], startIndex: number, endIndex: number, defaultOpen: boolean) {
+  private renderMessageGroup(messages: ChatLine[], startIndex: number, endIndex: number, defaultOpen: boolean, entryActionHeaders: ReadonlySet<ChatLine> = new Set()) {
     const disclosureKey = this.groupDisclosureKey(startIndex, endIndex, defaultOpen);
     const open = this.disclosures.isOpen(disclosureKey, defaultOpen);
     return html`
@@ -930,19 +927,19 @@ export class ChatView extends LitElement {
           <b class="label">${chatMessageGroupLabel(defaultOpen)}</b>
           <span>${summarizeChatGroup(messages)}</span>
         </summary>
-        ${open ? this.renderMessageGroupBody(messages, startIndex) : null}
+        ${open ? this.renderMessageGroupBody(messages, startIndex, entryActionHeaders) : null}
       </details>
     `;
   }
 
-  private renderMessageGroupBody(messages: ChatLine[], startIndex: number) {
+  private renderMessageGroupBody(messages: ChatLine[], startIndex: number, entryActionHeaders: ReadonlySet<ChatLine> = new Set()) {
     return html`
       <div class="group-body">
         ${messages.map((message, offset) => {
           const toolOnly = this.isToolExecutionOnlyMessage(message);
           return html`
             <section class=${toolOnly ? "group-msg tool-execution-shell" : `group-msg ${message.role}`} data-index=${startIndex + offset} data-scroll-anchor-id=${this.eventAnchorKey(startIndex + offset)}>
-              ${toolOnly ? null : this.renderMessageHeader(message, `${String(startIndex)}:${String(offset)}`, startIndex + offset)}
+              ${chatMessageHasHeader(message) ? this.renderMessageHeader(message, `${String(startIndex)}:${String(offset)}`, startIndex + offset, entryActionHeaders) : null}
               ${message.parts.map((part, partIndex) => this.renderPart(part, message, startIndex + offset, partIndex))}
             </section>
           `;
@@ -955,23 +952,23 @@ export class ChatView extends LitElement {
     return html`<span class="scroll-marker" data-marker-id=${markerId} aria-hidden="true"></span>`;
   }
 
-  private renderMessageHeader(message: ChatLine, key: string, index: number, label: string = message.role) {
+  private renderMessageHeader(message: ChatLine, key: string, index: number, entryActionHeaders: ReadonlySet<ChatLine>, label: string = message.role) {
     const meta = this.messageMetaLabel(message);
     const expanded = this.expandedMetaKey === key;
     return html`
       <div class="msg-header">
         <b class="label">${label}</b>
         <div class="msg-header-trailing">
-          ${this.renderMessageActions(message, key, this.messages[index - this.messageStart] ?? message)}
+          ${this.renderMessageActions(message, key, this.messages[index - this.messageStart] ?? message, entryActionHeaders.has(message))}
           <span class=${expanded ? "msg-meta expanded" : "msg-meta"} role="button" tabindex="0" title=${meta} aria-label=${meta} aria-expanded=${String(expanded)} @click=${() => { this.expandedMetaKey = expanded ? undefined : key; }} @keydown=${(event: KeyboardEvent) => { this.onMetaKeydown(event, key, expanded); }}>${meta}</span>
         </div>
       </div>
     `;
   }
 
-  private renderMessageActions(message: ChatLine, key: string, source: ChatLine) {
+  private renderMessageActions(message: ChatLine, key: string, source: ChatLine, includeEntryActions: boolean) {
     const actions = this.messageActionContext === undefined ? []
-      : this.messageActionAvailability.get(source, this.messageActions, this.messageActionContext, message)
+      : this.messageActionAvailability.get(source, this.messageActions, this.messageActionContext, message, includeEntryActions)
         .filter(({ action }) => action.target === "display" ? this.onDisplayedMessageAction !== undefined : this.onMessageAction !== undefined);
     if (actions.length === 0) return null;
     const feedback = this.messageActionFeedback;

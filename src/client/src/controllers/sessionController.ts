@@ -619,15 +619,15 @@ export class SessionController {
       throw error;
     }
     if (!this.isSelectedSessionIdentity(session.id, machineId)) return;
-    if (action === "fork") await this.forkSessionTree(entryId, result.tree);
-    else await this.navigateSessionTree(entryId, { mode: "none" }, result.tree);
+    if (action === "fork") await this.forkSessionTree(entryId, result.tree, true);
+    else await this.navigateSessionTree(entryId, { mode: "none" }, result.tree, true);
   }
 
   async navigateTree(targetId: string, summary: SessionTreeSummaryChoice): Promise<SessionTreeNavigateResult> {
     return this.navigateSessionTree(targetId, summary, this.getState().treeDialog);
   }
 
-  private async navigateSessionTree(targetId: string, summary: SessionTreeSummaryChoice, tree: SessionTreeSnapshot | undefined): Promise<SessionTreeNavigateResult> {
+  private async navigateSessionTree(targetId: string, summary: SessionTreeSummaryChoice, tree: SessionTreeSnapshot | undefined, retainCheckpoint?: boolean): Promise<SessionTreeNavigateResult> {
     const state = this.getState();
     const session = state.selectedSession;
     if (session === undefined || tree === undefined || session.archived === true || isClientPendingStartSessionInfo(session)) {
@@ -639,7 +639,9 @@ export class SessionController {
     const pending = { machineId, sessionId: session.id };
     this.pendingTreeActions.add(pending);
     try {
-      const result = await this.api.navigateTree(session, { targetId, expectedLeafId: tree.activeLeafId, summary }, machineId);
+      const result = await this.api.navigateTree(session, { targetId, expectedLeafId: tree.activeLeafId, summary,
+        ...(retainCheckpoint === undefined ? {} : { retainCheckpoint }),
+      }, machineId);
       await this.applySessionTreeNavigationResult(session, machineId, result, tree);
       return result;
     } catch (error) {
@@ -683,7 +685,7 @@ export class SessionController {
     return this.forkSessionTree(entryId, this.getState().treeDialog);
   }
 
-  private async forkSessionTree(entryId: string, tree: SessionTreeSnapshot | undefined): Promise<SessionTreeForkResult> {
+  private async forkSessionTree(entryId: string, tree: SessionTreeSnapshot | undefined, retainCheckpoint?: boolean): Promise<SessionTreeForkResult> {
     const state = this.getState();
     const session = state.selectedSession;
     if (session === undefined || tree === undefined || session.archived === true || isClientPendingStartSessionInfo(session)) {
@@ -696,7 +698,9 @@ export class SessionController {
     const pending = { machineId, sessionId: session.id };
     this.pendingTreeActions.add(pending);
     try {
-      const result = await this.api.forkTree(session, { entryId, expectedLeafId: tree.activeLeafId }, machineId);
+      const result = await this.api.forkTree(session, { entryId, expectedLeafId: tree.activeLeafId,
+        ...(retainCheckpoint === undefined ? {} : { retainCheckpoint }),
+      }, machineId);
       await this.applySessionTreeForkResult(session, machineId, result, expected, tree);
       return result;
     } catch (error) {

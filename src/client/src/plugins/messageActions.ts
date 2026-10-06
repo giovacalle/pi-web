@@ -57,6 +57,7 @@ export class MessageActionAvailabilityCache {
     actions: readonly RegisteredMessageAction[],
     context: Omit<MessageActionAvailabilityContext, "message">,
     displayed: ChatLine = message,
+    includeEntryActions = true,
   ): readonly AvailableMessageAction[] {
     const inputs = JSON.stringify([context.machine, context.session]);
     if (inputs !== this.inputs || actions.length !== this.actions.length || actions.some((action, index) => action !== this.actions[index])) {
@@ -65,13 +66,14 @@ export class MessageActionAvailabilityCache {
       this.messages = new WeakMap();
     }
     // One source can have several headers with the same role (thinking/text).
-    // Key by its displayed slice too, without rerunning historical checks on streams.
+    // Include canonical status: another slice can take ownership of entry actions
+    // without changing this source or displayed snapshot during a stream update.
     const snapshot = displayedMessageActionMessage(displayed);
-    const key = JSON.stringify([snapshot.role, snapshot.text]);
+    const key = JSON.stringify([snapshot.role, snapshot.text, includeEntryActions]);
     const slices = this.messages.get(message) ?? new Map<string, readonly AvailableMessageAction[]>();
     const cached = slices.get(key);
     if (cached !== undefined) return cached;
-    const entry = messageActionMessage(message, displayed.role);
+    const entry = includeEntryActions ? messageActionMessage(message, displayed.role) : undefined;
     const result = actions.flatMap((action) => action.target === "display"
       ? availableDisplayedMessageActions([action], { ...context, message: snapshot })
       : entry === undefined ? [] : availableMessageActions([action], { ...context, message: entry }));

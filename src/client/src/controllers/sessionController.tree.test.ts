@@ -49,10 +49,10 @@ describe("SessionController message shortcuts", () => {
     expect(runCommand).toHaveBeenCalledWith(oldSession, "/tree", "local");
     expect(state.treeDialog).toBeUndefined();
     if (action === "fork") {
-      expect(forkTree).toHaveBeenCalledWith(oldSession, { entryId: "root", expectedLeafId: "leaf-1" }, "local");
+      expect(forkTree).toHaveBeenCalledWith(oldSession, { entryId: "root", expectedLeafId: "leaf-1", retainCheckpoint: true }, "local");
       expect(navigateTree).not.toHaveBeenCalled();
     } else {
-      expect(navigateTree).toHaveBeenCalledWith(oldSession, { targetId: "root", expectedLeafId: "leaf-1", summary: { mode: "none" } }, "local");
+      expect(navigateTree).toHaveBeenCalledWith(oldSession, { targetId: "root", expectedLeafId: "leaf-1", summary: { mode: "none" }, retainCheckpoint: true }, "local");
       expect(forkTree).not.toHaveBeenCalled();
     }
     await expect(controller.actOnMessage("missing", action)).rejects.toThrow("no longer available");

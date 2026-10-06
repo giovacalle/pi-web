@@ -43,6 +43,7 @@ import { BUILTIN_COMMANDS } from "./builtinCommands.js";
 import { SessionCommandService } from "./sessionCommandService.js";
 import { SessionActivityMarker } from "./sessionActivityMarker.js";
 import { projectSessionTree, type ProjectableSessionTreeNode } from "./sessionTreeProjection.js";
+import { messageHistoryTargetId } from "./messageHistoryTarget.js";
 import { SessionArchiveStore, type ArchivedSessionRecord, type ArchiveSessionInput } from "./sessionArchiveStore.js";
 import { findArchiveCandidateByIdOrPrefix, planSessionArchiveTree, type SessionArchiveTreeCandidate } from "./sessionArchiveTree.js";
 import type { ActiveSession } from "./sessionRuntimeStore.js";
@@ -2895,10 +2896,10 @@ export class PiSessionService implements SessionRouteService {
   }
 
   async navigateTree(ref: PiSessionRef, request: ClientSessionTreeNavigateRequest): Promise<ClientSessionTreeNavigateResult> {
-    return this.navigateSessionTree(ref, request.targetId, request.expectedLeafId, sessionTreeNavigationOptions(request));
+    return this.navigateSessionTree(ref, request.targetId, request.expectedLeafId, sessionTreeNavigationOptions(request), undefined, request.retainCheckpoint);
   }
 
-  private async navigateSessionTree(ref: PiSessionRef, targetId: string, expectedLeafId: string | null, options: PiTreeNavigationOptions, expectedSession?: PiAgentSession): Promise<ClientSessionTreeNavigateResult> {
+  private async navigateSessionTree(ref: PiSessionRef, targetId: string, expectedLeafId: string | null, options: PiTreeNavigationOptions, expectedSession?: PiAgentSession, retainCheckpoint = false): Promise<ClientSessionTreeNavigateResult> {
     if (targetId.trim() === "") throw new Error("Session tree target is required");
     if (this.isTreeExclusiveSessionIdentityActive(ref.id)) {
       throw new Error("Stop current session activity before navigating the session tree");
@@ -2906,7 +2907,8 @@ export class PiSessionService implements SessionRouteService {
     await this.assertWritable(ref);
     const session = await this.getOrOpen(ref);
     if (expectedSession !== undefined && session !== expectedSession) throw new Error("This extension command belongs to an unavailable session runtime");
-    if (typeof session.navigateTree !== "function") throw new Error("Session tree navigation is not supported by this Pi runtime");
+    const navigateTree = session.navigateTree?.bind(session);
+    if (navigateTree === undefined) throw new Error("Session tree navigation is not supported by this Pi runtime");
     if (this.hasActiveWork(session)) throw new Error("Stop current session activity before navigating the session tree");
 
     // Acquire synchronously after the active-work check. No leaf-producing work
@@ -2918,14 +2920,24 @@ export class PiSessionService implements SessionRouteService {
         throw new Error("The session changed since /tree was opened. Reopen /tree and try again.");
       }
 
-      const activeEditableTargetParentId = activeEditableTreeTargetParentId(
+      if (retainCheckpoint) targetId = messageHistoryTargetId(session.sessionManager.getBranch(), targetId);
+      const checkpointTail = retainCheckpoint ? session.sessionManager.getBranch().find(
+        (entry) => isRecord(entry) && entry["id"] === targetId,
+      ) : undefined;
+      const retainCustomMessage = isRecord(checkpointTail) && checkpointTail["type"] === "custom_message";
+      if (retainCustomMessage && options.summarize === true) {
+        throw new Error("Retaining a custom-message checkpoint requires navigation without a branch summary");
+      }
+      const activeEditableTargetParentId = retainCustomMessage ? undefined : activeEditableTreeTargetParentId(
         session.sessionManager,
         targetId,
         oldLeafId,
       );
       this.publishActivity(session, options.summarize === true ? "summarizing branch" : "navigating session tree", "active");
       this.publishStatus(session);
-      let result = await session.navigateTree(targetId, options);
+      let result = retainCustomMessage
+        ? await navigateTreeRetainingCustomMessage(session.sessionManager, targetId, checkpointTail["parentId"], () => navigateTree(targetId, options))
+        : await navigateTree(targetId, options);
       if (
         activeEditableTargetParentId !== undefined
         && !result.cancelled
@@ -2939,7 +2951,7 @@ export class PiSessionService implements SessionRouteService {
         // extraction, agent-context rebuilding, and tree extension events.
         setSessionTreeLeaf(session.sessionManager, activeEditableTargetParentId);
         try {
-          result = await session.navigateTree(targetId, options);
+          result = await navigateTree(targetId, options);
         } catch (error: unknown) {
           session.sessionManager.branch(targetId);
           throw error;
@@ -3022,7 +3034,12 @@ export class PiSessionService implements SessionRouteService {
     this.publishActivity(session, "forking session from entry", "active");
     this.publishStatus(session);
     try {
-      const result = await this.commandService.forkEntry(session.sessionId, request.entryId, {
+      // forkEntry rechecks this same leaf after asynchronous naming and inside
+      // the replacement gate, so the resolved branch cutoff cannot go stale.
+      const entryId = request.retainCheckpoint === true
+        ? messageHistoryTargetId(session.sessionManager.getBranch(), request.entryId)
+        : request.entryId;
+      const result = await this.commandService.forkEntry(session.sessionId, entryId, {
         ...options,
         expectedLeafId: request.expectedLeafId,
         expectedSession: session,
@@ -5267,6 +5284,53 @@ function activeEditableTreeTargetParentId(
   const parentId = entry["parentId"];
   if (parentId === targetId) return undefined;
   return parentId === null || typeof parentId === "string" ? parentId : undefined;
+}
+
+/**
+ * Pi edits custom messages from their parent. For a retained checkpoint, remap
+ * that single leaf movement instead, before Pi rebuilds context/restores tools
+ * and emits session_tree. Restore the manager methods before extension handlers
+ * run: their appended history must not be overwritten by a post-event repair.
+ * The caller holds the tree-navigation gate and excludes branch summarization.
+ */
+async function navigateTreeRetainingCustomMessage(
+  manager: PiSessionManager,
+  targetId: string,
+  parentId: unknown,
+  navigate: () => ReturnType<NonNullable<PiAgentSession["navigateTree"]>>,
+): ReturnType<NonNullable<PiAgentSession["navigateTree"]>> {
+  if (parentId !== null && typeof parentId !== "string") throw new Error("This checkpoint has no valid history parent");
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- Restore exact identities; calls below explicitly bind the manager.
+  const { branch, resetLeaf } = manager;
+  let pending = true;
+  const restore = () => {
+    if (!pending) return;
+    pending = false;
+    manager.branch = branch;
+    manager.resetLeaf = resetLeaf;
+  };
+  try {
+    manager.branch = (entryId) => {
+      if (entryId === parentId) {
+        restore();
+        branch.call(manager, targetId);
+      } else branch.call(manager, entryId);
+    };
+    manager.resetLeaf = () => {
+      if (parentId === null) {
+        restore();
+        branch.call(manager, targetId);
+      } else resetLeaf.call(manager);
+    };
+    const result = await navigate();
+    if (result.cancelled) return result;
+    // The retained notice is context, not text to restore into the editor.
+    const { editorText, ...retainedResult } = result;
+    void editorText;
+    return retainedResult;
+  } finally {
+    restore();
+  }
 }
 
 function setSessionTreeLeaf(manager: PiSessionManager, leafId: string | null): void {
